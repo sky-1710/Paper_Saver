@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QPlainTextEdit
 
 from ..core.atomic_io import write_bytes_atomic
 from ..core.notebook import IMAGE_SUFFIXES, image_refs, resolve_image
+from ..render.markdown_display import center_display_maths, prepare_markdown
 
 __all__ = ["ImagePasteEdit", "markdown_html", "png_bytes", "save_png"]
 
@@ -40,7 +41,9 @@ def _file_url(path: Path) -> str:
 def markdown_html(text: str, base_dir: Path | None, max_image_width: int) -> str:
     """Markdown as the HTML body a QTextBrowser shows, images fitted to width.
 
-    Qt's own Markdown reader does the text; images are pointed at absolute
+    Qt's own Markdown reader does the text, after LaTeX and bold-beside-Korean
+    are rewritten into something it shows (see ``render.markdown_display``);
+    images are pointed at absolute
     file URLs first (so the result does not depend on the browser's search
     path) and given a width, because a 2400-pixel capture drawn at its natural
     size would push everything else off the side of a narrow panel.
@@ -53,10 +56,10 @@ def markdown_html(text: str, base_dir: Path | None, max_image_width: int) -> str
             replacement = f"![{ref.alt}]({_file_url(path)})" if path else f"*(이미지 없음: {ref.target})*"
             text = text[: ref.start] + replacement + text[ref.end :]
     document = QTextDocument()
-    document.setMarkdown(text)
+    document.setMarkdown(prepare_markdown(text))
     body = document.toHtml()
     match = re.search(r"<body[^>]*>(.*)</body>", body, re.S)
-    body = match.group(1) if match else body
+    body = center_display_maths(match.group(1) if match else body)
 
     def sized(match: re.Match[str]) -> str:
         src = html.unescape(match.group(1))
