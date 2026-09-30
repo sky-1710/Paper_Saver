@@ -1,0 +1,32 @@
+[project]
+name = "paper-saver"
+version = "0.1.0"
+description = "Side-by-side paper reader with a layout-faithful Korean translation"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests that run Codex spend the user's ChatGPT quota; opt in with `pytest -m engine`.
+addopts = "-q -m 'not engine'"
+markers = [
+    "engine: runs the real Codex CLI (slow, needs a sign-in, costs quota)",
+    "paper: needs a real PDF on this machine",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = ["B008", "B905", "E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+no_implicit_optional = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["paper_saver.core.*", "paper_saver.pdf.*", "paper_saver.render.*"]
+disallow_untyped_defs = true

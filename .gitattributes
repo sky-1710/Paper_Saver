@@ -1,0 +1,8 @@
+# Line endings are fixed per file type so a clone on any OS runs as-is.
+* text=auto
+*.command text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+*.png binary
+*.ico binary
+*.icns binary

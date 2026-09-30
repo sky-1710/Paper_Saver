@@ -1,0 +1,38 @@
+# Builds the standalone app on real Windows and macOS machines.
+# Run it from the repository's "Actions" tab (Run workflow), or push a tag
+# like v0.2.0. The zips appear under the run's "Artifacts".
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+          - os: macos-14          # Apple Silicon (M1 and later)
+            label: macos-arm64
+          - os: macos-13          # Intel Macs
+            label: macos-intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "pyinstaller>=6.10"
+      - name: Build, self-test, zip
+        run: python tools/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PaperSaver-${{ matrix.label }}
+          path: dist/PaperSaver-*.zip

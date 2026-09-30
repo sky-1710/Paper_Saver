@@ -1,0 +1,21 @@
+# Paper Saver - runtime dependencies
+
+# --- Desktop UI -------------------------------------------------------------
+# Essentials is QtCore/QtGui/QtWidgets, which is all this application needs:
+# there is no video, no audio and no web view anywhere in it. The Addons wheel
+# (~120 MB) is deliberately not required.
+PySide6-Essentials>=6.8,<6.10
+
+# --- PDF ---------------------------------------------------------------------
+# PyMuPDF does three jobs no other pure-Python library does well at once:
+# renders a page to a bitmap fast enough to scroll, reports every character's
+# bounding box (which is what makes sentence highlighting and word clicking
+# exact rather than estimated), and finds the tables and vector-drawing
+# clusters that must be protected from the translation.
+pymupdf>=1.24
+
+# --- Paragraph layout model -------------------------------------------------
+# PyMuPDF's own layout model (ONNX, CPU-only, ~0.5 s a page). Decides where
+# paragraphs, headings, captions, formulas and tables are; the extractor's own
+# rules are the fallback when it is missing. See paper_saver/pdf/layout_model.py.
+pymupdf-layout>=1.26
