@@ -163,3 +163,96 @@ def test_highlights_round_trip_and_recolor(tmp_path: Path) -> None:
     marks.set("p0b2s1", 0, "#ff6fb0", "Another.")
     marks.remove("p0b2s1")
     assert Highlights(tmp_path / "highlights.json").colors() == {"p0b1s1": "#4aa3ff"}
+
+
+# -- Obsidian vocabulary vault ----------------------------------------------------------
+
+
+def test_obsidian_register_links_both_files(tmp_path):
+    from paper_saver.core.obsidian import register_word
+
+    (tmp_path / "dictionary").mkdir()
+    (tmp_path / "dictionary_ko").mkdir()
+    (tmp_path / "dictionary" / "I words.md").write_text(
+        "- implication ^implication\n\t- [[I words_ko#^implicationko|ko]]\n- insolent ^06820c", encoding="utf-8"
+    )
+    entry = {"word": "inferred", "lemma": "infer", "pos": "동사", "in_context": "추론하다", "senses": ["암시하다"]}
+    result = register_word(
+        tmp_path, entry, example="Labels are inferred from ⟦m1⟧.", example_ko="레이블은 ⟦m1⟧에서 추론된다.", surface="inferred"
+    )
+    english = (tmp_path / "dictionary" / "I words.md").read_text(encoding="utf-8")
+    korean = (tmp_path / "dictionary_ko" / "I words_ko.md").read_text(encoding="utf-8")
+    assert english == (
+        "- implication ^implication\n\t- [[I words_ko#^implicationko|ko]]\n"
+        "- infer ^infer\n\t- [[I words_ko#^inferko|ko]]\n- insolent ^06820c"
+    )
+    assert korean == (
+        "- infer ^inferko\n\t- [[I words#^infer|eng]]\n\t  verb\n\t1. 추론하다\n"
+        "\t\tLabels are **inferred** from (수식).\n\t\t레이블은 (수식)에서 추론된다.\n\t2. 암시하다\n"
+    )
+    assert not result.already
+    assert register_word(tmp_path, entry).already
+
+
+def test_obsidian_register_appends_only_new_meanings(tmp_path):
+    from paper_saver.core.obsidian import register_word
+
+    for folder, name, text in (
+        ("dictionary", "P words.md", "- probe ^probe\n\t- [[P words_ko#^probeko|ko]]\n"),
+        (
+            "dictionary_ko",
+            "P words_ko.md",
+            "- probe ^probeko\n\t- [[P words#^probe|eng]]\n\t  verb\n\t1. 캐묻다, 조사하다\n\t\tex\n\n- propriety ^a3af67\n",
+        ),
+    ):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / name).write_text(text, encoding="utf-8")
+    entry = {"word": "probe", "pos": "명사", "in_context": "탐사선", "senses": ["캐묻다, 조사하다"]}
+    result = register_word(tmp_path, entry, example="A probe landed.", example_ko="탐사선이 착륙했다.")
+    assert result.appended == 1
+    assert (tmp_path / "dictionary_ko" / "P words_ko.md").read_text(encoding="utf-8") == (
+        "- probe ^probeko\n\t- [[P words#^probe|eng]]\n\t  verb\n\t1. 캐묻다, 조사하다\n\t\tex\n"
+        "\t  noun\n\t2. 탐사선\n\t\tA **probe** landed.\n\t\t탐사선이 착륙했다.\n\n- propriety ^a3af67\n"
+    )
+    assert register_word(tmp_path, entry).already
+
+
+def test_obsidian_register_adds_example_under_existing_meaning(tmp_path):
+    from paper_saver.core.obsidian import register_word
+
+    for folder, name, text in (
+        ("dictionary", "I words.md", "- inference ^inference\n\t- [[I words_ko#^inferenceko|ko]]\n"),
+        (
+            "dictionary_ko",
+            "I words_ko.md",
+            "- inference ^inferenceko\n\t- [[I words#^inference|eng]]\n\t  noun\n"
+            "\t1. 추론(한 것)\n\t\told example\n\t\t옛 예문\n\t2. 추론 (행위)\n\t\tother\n\n- intermediate ^i\n",
+        ),
+    ):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / name).write_text(text, encoding="utf-8")
+    entry = {"word": "inference", "pos": "명사", "in_context": "추론 (한 것)", "senses": ["추론(행위)"]}
+    result = register_word(tmp_path, entry, example="The inference holds.", example_ko="그 추론은 성립한다.")
+    assert result.example_added and not result.appended
+    assert (tmp_path / "dictionary_ko" / "I words_ko.md").read_text(encoding="utf-8") == (
+        "- inference ^inferenceko\n\t- [[I words#^inference|eng]]\n\t  noun\n"
+        "\t1. 추론(한 것)\n\t\told example\n\t\t옛 예문\n\t\tThe **inference** holds.\n\t\t그 추론은 성립한다.\n"
+        "\t2. 추론 (행위)\n\t\tother\n\n- intermediate ^i\n"
+    )
+    # The same sentence is not added twice.
+    assert register_word(tmp_path, entry, example="The inference holds.", example_ko="그 추론은 성립한다.").already
+
+
+def test_obsidian_register_upgrades_existing_stub(tmp_path):
+    from paper_saver.core.obsidian import register_word
+
+    for folder, name in (("dictionary", "P words.md"), ("dictionary_ko", "P words_ko.md")):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / name).write_text("- perilous ^6fedca\n- probe ^probe\n", encoding="utf-8")
+    register_word(tmp_path, {"word": "perilous", "pos": "형용사", "in_context": "위험한"})
+    assert (tmp_path / "dictionary" / "P words.md").read_text(encoding="utf-8").startswith(
+        "- perilous ^6fedca\n\t- [[P words_ko#^6fedcako|ko]]\n- probe"
+    )
+    assert (tmp_path / "dictionary_ko" / "P words_ko.md").read_text(encoding="utf-8").startswith(
+        "- perilous ^6fedcako\n\t- [[P words#^6fedca|eng]]\n\t  adjective\n\t1. 위험한\n- probe"
+    )

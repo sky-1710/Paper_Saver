@@ -3,7 +3,9 @@
 Shows the cached entry instantly when there is one; otherwise shows the same
 word's entry from another sentence (marked as such) while the contextual
 lookup runs, or a plain "찾는 중" when the word is new. The star adds the entry
-to the paper's wordbook with this sentence as its example (§3.3).
+to the paper's wordbook with this sentence as its example (§3.3); "Obsidian 등록"
+files it in the reader's Obsidian vocabulary vault, optionally with the
+sentence and its translation as the example.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from typing import Any
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -30,6 +33,8 @@ class DictionaryPanel(QWidget):
     lookupRequested = Signal(str, str)
     #: Star toggled on the entry shown: the entry, starred?
     starToggled = Signal(dict, bool)
+    #: Register the entry shown in Obsidian: the entry, include the sentence?
+    registerRequested = Signal(dict, bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -45,9 +50,20 @@ class DictionaryPanel(QWidget):
         self.star.setEnabled(False)
         self.star.toggled.connect(self._star)
 
+        self.register = QPushButton("📥 Obsidian 등록")
+        self.register.setToolTip("Obsidian 단어장(dictionary / dictionary_ko)에 이 단어와 뜻을 기입합니다")
+        self.register.setEnabled(False)
+        self.register.clicked.connect(self._register)
+        self.with_example = QCheckBox("이 문장을 예문으로 (번역 포함)")
+        self.with_example.setChecked(True)
+
         top = QHBoxLayout()
         top.addWidget(self.search, 1)
         top.addWidget(self.star)
+        obsidian = QHBoxLayout()
+        obsidian.addWidget(self.register)
+        obsidian.addWidget(self.with_example)
+        obsidian.addStretch(1)
 
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(True)
@@ -57,6 +73,7 @@ class DictionaryPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addLayout(top)
+        layout.addLayout(obsidian)
         layout.addWidget(self.view, 1)
         layout.addWidget(self.status)
         self.show_welcome()
@@ -89,6 +106,7 @@ class DictionaryPanel(QWidget):
     def show_welcome(self) -> None:
         self._entry = None
         self.star.setEnabled(False)
+        self.register.setEnabled(False)
         self.view.setHtml(
             "<p style='color:#666'>왼쪽 원문에서 모르는 단어를 클릭하면<br>"
             "그 문장 안에서의 뜻을 바로 보여줍니다.</p>"
@@ -98,6 +116,7 @@ class DictionaryPanel(QWidget):
 
     def show_loading(self, word: str, related: dict[str, Any] | None = None) -> None:
         self.star.setEnabled(False)
+        self.register.setEnabled(False)
         body = f"<h2 style='margin:0'>{html.escape(word)}</h2>"
         if related:
             body += "<p style='color:#a60'>다른 문장에서 찾았던 뜻 (이 문장 기준 뜻을 찾는 중…)</p>"
@@ -111,6 +130,7 @@ class DictionaryPanel(QWidget):
     def show_entry(self, entry: dict[str, Any], *, starred: bool, cached: bool) -> None:
         self._entry = entry
         self.star.setEnabled(True)
+        self.register.setEnabled(True)
         self.star.blockSignals(True)
         self.star.setChecked(starred)
         self.star.setText("★ 단어장" if starred else "☆ 단어장")
@@ -120,6 +140,7 @@ class DictionaryPanel(QWidget):
 
     def show_error(self, word: str, message: str) -> None:
         self.star.setEnabled(False)
+        self.register.setEnabled(False)
         self.view.setHtml(
             f"<h2 style='margin:0'>{html.escape(word)}</h2>"
             f"<p style='color:#b00'>{html.escape(message).replace(chr(10), '<br>')}</p>"
@@ -157,6 +178,13 @@ class DictionaryPanel(QWidget):
             marked = html.escape(word)
             text = text.replace(marked, f"<b style='background:#ffe58a'>{marked}</b>", 1)
         return f"<hr><div style='color:#555;font-size:92%'>{text}</div>"
+
+    def show_status(self, text: str) -> None:
+        self.status.setText(text)
+
+    def _register(self) -> None:
+        if self._entry is not None:
+            self.registerRequested.emit(self._entry, self.with_example.isChecked() and bool(self._sentence))
 
     def _star(self, on: bool) -> None:
         self.star.setText("★ 단어장" if on else "☆ 단어장")

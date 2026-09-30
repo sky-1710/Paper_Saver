@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -23,10 +24,12 @@ from PySide6.QtGui import (
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
+    QFileDialog,
     QFrame,
     QInputDialog,
     QLabel,
     QMenu,
+    QMessageBox,
     QScrollArea,
     QSplitter,
     QTabWidget,
@@ -36,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from ..config import Settings
 from ..core.geometry import Rect
+from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
 from ..core.project import HIGHLIGHT_COLORS, WordEntry
 from ..translate.dictionary import Dictionary, clean_word
 from ..translate.engine import TranslationEngine
@@ -184,6 +188,10 @@ class ReaderView(QWidget):
             lambda word, sentence: self.lookup(word, sentence, self.dictionary_panel.sentence_id, self.dictionary_panel.page)
         )
         self.dictionary_panel.starToggled.connect(self._on_star)
+        self.dictionary_panel.registerRequested.connect(self._on_register)
+        example = self.dictionary_panel.with_example
+        example.setChecked(bool(self.settings.get("obsidian_example", True)))
+        example.toggled.connect(lambda on: self.settings.set("obsidian_example", on))
         self.notes_panel.jumpRequested.connect(self.jump_to_sentence)
         self.notes_panel.notesChanged.connect(self._apply_notes)
         self.wordbook_panel.jumpRequested.connect(self.jump_to_sentence)
@@ -349,6 +357,68 @@ class ReaderView(QWidget):
         else:
             wordbook.remove(word)
         self.wordbook_panel.refresh()
+
+    def _on_register(self, entry: dict, with_example: bool) -> None:
+        """File the shown word in the Obsidian vocabulary vault, off the UI thread."""
+        vault = self._obsidian_vault()
+        if vault is None:
+            return
+        panel = self.dictionary_panel
+        example = example_ko = ""
+        if with_example:
+            example = panel.sentence
+            example_ko = self.session.project.translations.get(panel.sentence_id) or ""
+        surface = str(entry.get("word", ""))
+        panel.register.setEnabled(False)
+        panel.show_status("Obsidian에 기입하는 중…")
+
+        def work(_cancel, _report):
+            return register_word(vault, entry, example=example, example_ko=example_ko, surface=surface)
+
+        def finished(result) -> None:
+            panel.register.setEnabled(True)
+            where = f"{result.korean_file.parent.name}/{result.korean_file.name}"
+            if result.already:
+                panel.show_status(f"이미 같은 뜻으로 등록된 단어입니다 — {where}")
+                return
+            added = []
+            if result.appended:
+                added.append(f"새 뜻 {result.appended}개")
+            if result.example_added:
+                added.append("기존 뜻에 예문")
+            if added:
+                message = f"'{result.word}'에 {' · '.join(added)} 추가됨 — {where}"
+            else:
+                message = f"'{result.word}' 등록됨 — {where}"
+            if example and not example_ko:
+                message += " (문장 번역이 아직 없어 영문 예문만)"
+            panel.show_status(message)
+
+        def failed(exc) -> None:
+            panel.register.setEnabled(True)
+            message = str(exc) if isinstance(exc, ObsidianError) else f"기입하지 못했습니다: {exc}"
+            panel.show_status(message)
+
+        task = BackgroundTask(work, name="obsidian")
+        task.succeeded.connect(finished)
+        task.failed.connect(failed)
+        task.start()
+
+    def _obsidian_vault(self) -> Path | None:
+        """The vault folder from settings, or asked for once and remembered."""
+        stored = self.settings.get("obsidian_vocab_dir") or ""
+        if stored and is_vocab_vault(Path(stored)):
+            return Path(stored)
+        path = QFileDialog.getExistingDirectory(
+            self, "Obsidian 영어 단어장 폴더 선택 (dictionary 폴더가 들어 있는 곳)", stored or str(Path.home())
+        )
+        if not path:
+            return None
+        if not is_vocab_vault(Path(path)):
+            QMessageBox.warning(self, "Obsidian 등록", "선택한 폴더 안에 dictionary 폴더가 없습니다.")
+            return None
+        self.settings.set("obsidian_vocab_dir", path)
+        return Path(path)
 
     def _reveal_side(self) -> None:
         sizes = self.splitter.sizes()
