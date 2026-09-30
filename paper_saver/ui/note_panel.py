@@ -49,6 +49,7 @@ from ..core.chat import capture_name
 from ..core.notebook import ASSETS_DIR, copy_linked_images, image_link, read_note, write_note
 from ..core.notion import NotionClient, NotionError, export_markdown, page_id_from
 from ..core.project import Project
+from .keys import CAPTURE_LABEL, PASTE_LABEL
 from .markdown_view import ImagePasteEdit, markdown_html, save_png
 from .workers import BackgroundTask
 
@@ -145,7 +146,7 @@ class NotePanel(QWidget):
 
         self.editor = ImagePasteEdit()
         self.editor.setPlaceholderText(
-            "Markdown 노트. 캡처(Ctrl+Shift+X) → '노트에 붙이기', 또는 스크린샷을 Ctrl+V로 붙여 넣으세요.\n"
+            f"Markdown 노트. 캡처({CAPTURE_LABEL}) → '노트에 붙이기', 또는 스크린샷을 {PASTE_LABEL}로 붙여 넣으세요.\n"
             "자동 저장됩니다. 저장 위치는 '파일 ▾ → 다른 곳에 저장'으로 자유롭게 바꿀 수 있습니다."
         )
         self.editor.textChanged.connect(self._changed)

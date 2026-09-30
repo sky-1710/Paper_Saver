@@ -56,8 +56,9 @@ from ..translate import engine_from_settings
 from ..translate.dictionary import Dictionary
 from ..translate.engine import EngineRateLimited, TranslationCancelled, TranslationEngine
 from ..translate.runner import Progress, translate_paper
+from .keys import CAPTURE_KEY, CAPTURE_LABEL
 from .note_panel import NotionDialog
-from .reader_view import CAPTURE_KEY, ReaderView
+from .reader_view import ReaderView
 from .session import PaperSession
 from .workers import BackgroundTask
 
@@ -232,7 +233,7 @@ class MainWindow(QMainWindow):
         fit = QAction("폭 맞춤", self, triggered=lambda: self.reader and self.reader.fit_width())
         side = QAction("옆 패널", self, shortcut="Ctrl+B", triggered=lambda: self.reader and self.reader.toggle_side())
         self.capture_action = QAction("✂ 캡처", self, shortcut=CAPTURE_KEY, checkable=True)
-        self.capture_action.setToolTip(f"영역을 잘라 GPT에게 묻거나 노트에 붙입니다 ({CAPTURE_KEY})")
+        self.capture_action.setToolTip(f"영역을 잘라 GPT에게 묻거나 노트에 붙입니다 ({CAPTURE_LABEL})")
         self.capture_action.triggered.connect(lambda: self.reader and self.reader.toggle_capture())
 
         export_menu = QMenu(self)

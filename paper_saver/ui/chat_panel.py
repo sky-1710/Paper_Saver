@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.chat import ChatLog, ChatMessage
+from .keys import CAPTURE_LABEL
 from .markdown_view import ImagePasteEdit, markdown_html
 
 __all__ = ["ChatPanel"]
@@ -66,7 +67,7 @@ class ChatPanel(QWidget):
         self.input.submit_on_enter = True
         self.input.setPlaceholderText(
             "논문에 대해 물어보세요. Enter 보내기 · Shift+Enter 줄바꿈\n"
-            "캡처(Ctrl+Shift+X)나 붙여 넣은 이미지를 함께 보낼 수 있습니다."
+            f"캡처({CAPTURE_LABEL})나 붙여 넣은 이미지를 함께 보낼 수 있습니다."
         )
         self.input.setFixedHeight(76)
         self.input.submitted.connect(self.send)
@@ -103,7 +104,7 @@ class ChatPanel(QWidget):
         if not self.log.messages:
             parts.append(
                 "<p style='color:#666'>이 논문에 대해 GPT에게 물어볼 수 있습니다.<br>"
-                "그림·표·수식은 <b>캡처</b>(툴바 또는 Ctrl+Shift+X)로 잘라서 함께 보내세요.</p>"
+                f"그림·표·수식은 <b>캡처</b>(툴바 또는 {CAPTURE_LABEL})로 잘라서 함께 보내세요.</p>"
                 "<p style='color:#999;font-size:9pt'>질문과 그때 첨부한 캡처, 보고 있는 쪽의 본문이 "
                 "Codex를 통해 OpenAI로 전송됩니다.</p>"
             )

@@ -5,7 +5,7 @@ sentence on either side lights the sentence and its counterpart, and the strip
 along the bottom shows the pair in full - useful where the Korean had to be set
 small to fit its rectangle.
 
-Capture (Ctrl+Shift+X) turns the next drag on either pane into a rectangle;
+Capture (Ctrl+Shift+X, ⌘⇧X on a Mac) turns the next drag on either pane into a rectangle;
 the region is rendered sharp and can be asked about in the GPT tab, pasted
 into the note, or copied.
 """
@@ -53,6 +53,7 @@ from ..translate.engine import TranslationCancelled, TranslationEngine
 from ..translate.prompts import chat_prompt
 from .chat_panel import ChatPanel
 from .dictionary_panel import DictionaryPanel
+from .keys import CAPTURE_LABEL
 from .markdown_view import save_png
 from .note_panel import NotePanel
 from .notes_panel import NotesPanel
@@ -66,7 +67,6 @@ __all__ = ["ReaderView"]
 
 NOTE_KEY = "Ctrl+Shift+M" if sys.platform == "darwin" else "Ctrl+M"
 HIGHLIGHT_KEY = "Ctrl+Shift+H" if sys.platform == "darwin" else "Ctrl+H"
-CAPTURE_KEY = "Ctrl+Shift+X"
 #: Captures sent again with a follow-up question, at most.
 FOLLOW_UP_IMAGES = 3
 #: How the keys read in messages: Cmd on a Mac.
@@ -628,7 +628,7 @@ class ReaderView(QWidget):
         for canvas in (self.left, self.right):
             canvas.set_capture_mode(True)
         self.captureModeChanged.emit(True)
-        self.statusMessage.emit("캡처할 영역을 원문이나 번역 위에서 드래그하세요. (Esc·우클릭: 취소)")
+        self.statusMessage.emit(f"캡처할 영역을 원문이나 번역 위에서 드래그하세요. (Esc·우클릭·{CAPTURE_LABEL}: 취소)")
 
     def cancel_capture(self) -> None:
         if not self.capturing:
