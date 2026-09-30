@@ -1,9 +1,13 @@
-"""The reading screen: original | translation | dictionary · notes · words.
+"""The reading screen: original | translation | dictionary · GPT · note · memos · words.
 
 The two panes scroll as one and highlight as one (§1.3, §2.3). Pointing near a
 sentence on either side lights the sentence and its counterpart, and the strip
 along the bottom shows the pair in full - useful where the Korean had to be set
 small to fit its rectangle.
+
+Capture (Ctrl+Shift+X) turns the next drag on either pane into a rectangle;
+the region is rendered sharp and can be asked about in the GPT tab, pasted
+into the note, or copied.
 """
 
 from __future__ import annotations
@@ -16,8 +20,10 @@ from pathlib import Path
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QGuiApplication,
     QIcon,
+    QImage,
     QKeySequence,
     QPixmap,
     QShortcut,
@@ -38,12 +44,17 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import Settings
+from ..core.chat import ChatLog
 from ..core.geometry import Rect
 from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
 from ..core.project import HIGHLIGHT_COLORS, WordEntry
 from ..translate.dictionary import Dictionary, clean_word
-from ..translate.engine import TranslationEngine
+from ..translate.engine import TranslationCancelled, TranslationEngine
+from ..translate.prompts import chat_prompt
+from .chat_panel import ChatPanel
 from .dictionary_panel import DictionaryPanel
+from .markdown_view import save_png
+from .note_panel import NotePanel
 from .notes_panel import NotesPanel
 from .page_canvas import MARGIN, MarginNote, PageCanvas, RangeMark
 from .session import PaperSession
@@ -55,6 +66,9 @@ __all__ = ["ReaderView"]
 
 NOTE_KEY = "Ctrl+Shift+M" if sys.platform == "darwin" else "Ctrl+M"
 HIGHLIGHT_KEY = "Ctrl+Shift+H" if sys.platform == "darwin" else "Ctrl+H"
+CAPTURE_KEY = "Ctrl+Shift+X"
+#: Captures sent again with a follow-up question, at most.
+FOLLOW_UP_IMAGES = 3
 #: How the keys read in messages: Cmd on a Mac.
 _MOD = "⌘⇧" if sys.platform == "darwin" else "Ctrl+"
 
@@ -91,6 +105,7 @@ def _pane(title: str, canvas: PageCanvas) -> tuple[QWidget, _Scroll]:
 class ReaderView(QWidget):
     statusMessage = Signal(str)
     pageChanged = Signal(int)
+    captureModeChanged = Signal(bool)
 
     def __init__(
         self,
@@ -110,6 +125,10 @@ class ReaderView(QWidget):
         self._lookup_serial = 0
         self._syncing = False
         self._page = 0
+        self._chat_task: BackgroundTask | None = None
+        self._closed = False
+        #: What each capture of this session shows, for the prompt.
+        self._capture_notes: dict[str, str] = {}
 
         project = session.project
         self.left = PageCanvas(session, translated=False)
@@ -121,8 +140,13 @@ class ReaderView(QWidget):
         self.dictionary_panel = DictionaryPanel()
         self.notes_panel = NotesPanel(project.notes, order)
         self.wordbook_panel = WordbookPanel(project.wordbook, project.exports_dir)
+        self.chat_log = ChatLog(project.root / "chat.json")
+        self.chat_panel = ChatPanel(self.chat_log)
+        self.note_panel = NotePanel(project, settings)
         self.side = QTabWidget()
         self.side.addTab(self.dictionary_panel, "사전")
+        self.side.addTab(self.chat_panel, "GPT")
+        self.side.addTab(self.note_panel, "노트")
         self.side.addTab(self.notes_panel, "메모")
         self.side.addTab(self.wordbook_panel, "단어장")
         self.side.setMinimumWidth(260)
@@ -196,11 +220,25 @@ class ReaderView(QWidget):
         self.notes_panel.notesChanged.connect(self._apply_notes)
         self.wordbook_panel.jumpRequested.connect(self.jump_to_sentence)
 
+        for canvas in (self.left, self.right):
+            canvas.regionCaptured.connect(
+                lambda page, rect, c=canvas: self._on_capture(page, rect, translated=c.translated)
+            )
+            canvas.captureCancelled.connect(self.cancel_capture)
+        self.chat_panel.sendRequested.connect(self.ask_gpt)
+        self.chat_panel.stopRequested.connect(self.stop_gpt)
+        self.chat_panel.imagePasted.connect(
+            lambda image: self.chat_panel.attach(self._save_capture(image, None, "붙여 넣은 이미지"))
+        )
+        self.chat_panel.toNoteRequested.connect(self.answer_to_note)
+        self.note_panel.statusMessage.connect(self.statusMessage)
+
         # Qt maps Ctrl to Cmd on a Mac, where Cmd+M minimises and Cmd+H hides
         # the application before the window ever sees the key - so the Mac
         # gets Shift added. See NOTE_KEY / HIGHLIGHT_KEY.
         QShortcut(QKeySequence(NOTE_KEY), self, activated=self._note_on_hover)
         QShortcut(QKeySequence(HIGHLIGHT_KEY), self, activated=self._highlight_on_hover)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.cancel_capture)
         QShortcut(QKeySequence("Ctrl+="), self, activated=lambda: self.zoom_step(1))
         QShortcut(QKeySequence("Ctrl++"), self, activated=lambda: self.zoom_step(1))
         QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self.zoom_step(-1))
@@ -574,10 +612,152 @@ class ReaderView(QWidget):
             self.session.invalidate(ref.page)
             self._set_pair(sentence_id)
 
+    # -- capture ------------------------------------------------------------------------
+
+    @property
+    def capturing(self) -> bool:
+        return self.left.capture_mode
+
+    def toggle_capture(self) -> None:
+        if self.capturing:
+            self.cancel_capture()
+        else:
+            self.start_capture()
+
+    def start_capture(self) -> None:
+        for canvas in (self.left, self.right):
+            canvas.set_capture_mode(True)
+        self.captureModeChanged.emit(True)
+        self.statusMessage.emit("캡처할 영역을 원문이나 번역 위에서 드래그하세요. (Esc·우클릭: 취소)")
+
+    def cancel_capture(self) -> None:
+        if not self.capturing:
+            return
+        for canvas in (self.left, self.right):
+            canvas.set_capture_mode(False)
+        self.captureModeChanged.emit(False)
+
+    def _on_capture(self, page: int, rect: Rect, *, translated: bool) -> None:
+        self.cancel_capture()
+        image = self.session.capture(page, rect, translated=translated)
+        alt = f"p.{page + 1} {'번역' if translated else '원문'}"
+        menu = QMenu(self)
+        ask = menu.addAction("GPT에게 질문하기")
+        note = menu.addAction("노트에 붙이기")
+        both = menu.addAction("노트에 붙이고 GPT에게도 질문")
+        menu.addSeparator()
+        copy = menu.addAction("클립보드에 복사")
+        chosen = menu.exec(QCursor.pos())
+        action = {ask: "ask", note: "note", both: "both", copy: "copy"}.get(chosen)
+        if action:
+            self.use_capture(image, page, alt, action)
+
+    def use_capture(self, image: QImage, page: int | None, alt: str, action: str) -> None:
+        """Do what was chosen with a capture: "ask", "note", "both" or "copy"."""
+        if action == "copy":
+            QGuiApplication.clipboard().setImage(image)
+            self.statusMessage.emit("캡처를 클립보드에 복사했습니다.")
+            return
+        if action in ("note", "both"):
+            if self.note_panel.insert_image(image, alt, page) is not None and action == "note":
+                self._show_tab(self.note_panel)
+                self.note_panel.editor.setFocus()
+        if action in ("ask", "both"):
+            self.chat_panel.attach(self._save_capture(image, page, alt))
+            self._show_tab(self.chat_panel)
+
+    def _save_capture(self, image: QImage, page: int | None, what: str) -> str:
+        path = save_png(image, self.chat_log.new_capture_path(page))
+        relative = self.chat_log.relative(path)
+        self._capture_notes[relative] = f"{what} 영역을 잘라낸 캡처" if page is not None else what
+        return relative
+
+    def _show_tab(self, widget: QWidget) -> None:
+        self.side.setCurrentWidget(widget)
+        self._reveal_side()
+
+    # -- GPT --------------------------------------------------------------------------
+
+    def _page_text(self, number: int) -> str:
+        page = self.session.layout.pages[number]
+        return "\n\n".join(_plain(block.text) for block in page.blocks if block.text.strip())
+
+    def ask_gpt(self, question: str, images: list[str]) -> None:
+        if self._chat_task is not None and self._chat_task.running:
+            return
+        engine = self._engine_provider()
+        if engine is None:
+            self.chat_panel.failed("GPT 사용에 동의하고 Codex가 설치되어 있어야 질문할 수 있습니다.", question, images)
+            return
+        pages = [int(m.group(1)) - 1 for i in images if (m := re.search(r"capture-p(\d+)-", i))]
+        page = pages[0] if pages else self._page
+        history = self.chat_log.history()
+        # A follow-up without a picture is usually about the last one asked about.
+        earlier = [] if images else self.chat_log.recent_images(FOLLOW_UP_IMAGES)
+        attached = [i for i in [*earlier, *images] if self.chat_log.absolute(i).is_file()]
+        notes = [
+            ("이전 질문에 첨부했던 " if i in earlier else "")
+            + self._capture_notes.get(i, "논문 화면에서 잘라낸 캡처")
+            for i in attached
+        ]
+        prompt = chat_prompt(
+            question, title=self.session.project.title, page_label=f"p.{page + 1}",
+            page_text=self._page_text(page), history=history, image_notes=notes,
+        )
+        message = self.chat_log.add("user", question, images=images, page=page)
+        self.chat_panel.accepted()
+        paths = [self.chat_log.absolute(i) for i in attached]
+
+        def work(cancel, _report):  # type: ignore[no-untyped-def]
+            return engine.ask(prompt, images=paths, cancel=cancel)
+
+        # The paper may be closed before the answer comes back: the log still
+        # takes it, but the panel is gone and must not be touched.
+        def answered(answer: str) -> None:
+            self.chat_log.add("assistant", answer.strip())
+            if not self._closed:
+                self.chat_panel.set_busy(False)
+
+        def failed(exc: Exception) -> None:
+            self.chat_log.remove(message.id)
+            if not self._closed:
+                text = "질문을 멈췄습니다." if isinstance(exc, TranslationCancelled) else str(exc)
+                self.chat_panel.failed(text, question, images)
+
+        task = BackgroundTask(work, name="chat")
+        task.succeeded.connect(answered)
+        task.failed.connect(failed)
+        self._chat_task = task.start()
+
+    def stop_gpt(self) -> None:
+        if self._chat_task is not None and self._chat_task.running:
+            self._chat_task.cancel()
+
+    def answer_to_note(self, answer_id: str) -> None:
+        """Question, its captures and the answer, appended to the note."""
+        answer = next((m for m in self.chat_log.messages if m.id == answer_id), None)
+        if answer is None:
+            return
+        question = self.chat_log.question_for(answer_id)
+        parts: list[str] = []
+        if question is not None:
+            if question.text.strip():
+                parts.append("> **Q.** " + question.text.strip().replace("\n", "\n> "))
+            where = f"p.{question.page + 1}" if question.page is not None else ""
+            parts += [self.note_panel.link_file(self.chat_log.absolute(i), where) for i in question.images]
+        parts.append(answer.text.strip())
+        self.note_panel.append("\n\n".join(parts))
+        self._show_tab(self.note_panel)
+        self.statusMessage.emit("GPT 답변을 노트에 넣었습니다.")
+
     # -- lifetime ---------------------------------------------------------------------
 
     def shutdown(self) -> None:
+        self._closed = True
+        self.cancel_capture()
         self.notes_panel.save_memo()
+        self.note_panel.shutdown()
+        self.stop_gpt()
         if self._lookup_task is not None:
             self._lookup_task.cancel()
 

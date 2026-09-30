@@ -26,6 +26,12 @@ Every flag there is load-bearing:
     anyway it cannot write anything.
 ``--skip-git-repo-check``
     Codex otherwise refuses to start outside a Git repository.
+``--image FILE`` (questions only)
+    Capture images the reader attached to a question. Codex reads them
+    itself before the run, so the read-only sandbox does not get in the way.
+    They go first, straight after ``exec``: the option takes any number of
+    values, and the next ``--flag`` is what ends the list - put last, it
+    would swallow the ``-`` that means "prompt on stdin".
 ``--ignore-user-config``
     ``~/.codex/config.toml`` is set up for whatever the user does with Codex
     otherwise, and none of it belongs in a translation. Two parts actively
@@ -47,6 +53,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -175,6 +182,7 @@ class CodexEngine(TranslationEngine):
     key: str = "codex"
     label: str = "Codex CLI (ChatGPT sign-in)"
     sends_text_externally: bool = True
+    supports_images: bool = True
 
     #: Explicit path to the program, when the user set one.
     binary: str | Path | None = None
@@ -222,9 +230,11 @@ class CodexEngine(TranslationEngine):
         version = (result.stdout or result.stderr).strip().splitlines()
         return EngineAvailability(ready=True, detail=version[0] if version else str(path))
 
-    def _command(self, path: Path, answer_file: Path) -> list[str]:
-        cmd = [
-            str(path), "exec",
+    def _command(self, path: Path, answer_file: Path, images: Sequence[Path] = ()) -> list[str]:
+        cmd = [str(path), "exec"]
+        for image in images:
+            cmd += ["--image", str(image)]
+        cmd += [
             "--skip-git-repo-check",
             "--ephemeral",
             "--ignore-user-config",
@@ -238,6 +248,15 @@ class CodexEngine(TranslationEngine):
         return [*cmd, "-"]
 
     def translate(self, prompt: str, *, cancel: threading.Event) -> str:
+        return self._run(prompt, (), cancel)
+
+    def ask(self, prompt: str, *, images: Sequence[Path] = (), cancel: threading.Event) -> str:
+        missing = [str(p) for p in images if not Path(p).is_file()]
+        if missing:
+            raise TranslationError("첨부한 캡처 파일을 찾을 수 없습니다:\n" + "\n".join(missing))
+        return self._run(prompt, [Path(p).resolve() for p in images], cancel)
+
+    def _run(self, prompt: str, images: Sequence[Path], cancel: threading.Event) -> str:
         path = self.resolve()
         # Codex treats its working directory as the workspace root. A scratch
         # folder keeps it away from the paper project and from whatever
@@ -250,7 +269,7 @@ class CodexEngine(TranslationEngine):
             answer_file = workspace / "answer.md"
             try:
                 process = subprocess.Popen(
-                    self._command(path, answer_file),
+                    self._command(path, answer_file, images),
                     cwd=str(workspace),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,

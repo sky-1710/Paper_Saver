@@ -8,6 +8,7 @@ equation and column boundary in the same place at the same size.
     Paper PDF → layout extraction → sentence split → GPT literal translation
              → translated page composed at original coordinates
              → hover-linked sentences · click-to-dictionary · notes
+             → capture a region → ask GPT about it · paste it into a Markdown note → Notion
 
 Paper Saver is the sibling of Lecture Saver
 and follows its conventions: PySide6 desktop app, a pure-Python core with no Qt
@@ -79,6 +80,31 @@ thinking.
 §4.3 Both autosave. Nothing the reader types may be lost to a crash, so writes
 are atomic and debounced, never on a "save" the reader has to remember.
 
+§4.4 The note: a Markdown file per paper that the reader may put anywhere
+(project folder by default, or an Obsidian vault). Pictures live in `assets/`
+beside it and are linked relatively, so the file reads the same in any
+Markdown tool; moving the note copies the pictures it links. A save never
+silently overwrites an edit made in another program: that version is kept
+beside the note first.
+
+§4.5 Notion export: on the reader's press only, the note becomes a child page
+of a Notion page they chose, images uploaded. Re-exporting replaces the old
+page by trashing it (restorable), never by editing it block by block.
+
+---
+
+## 4b. CAPTURE AND QUESTIONS
+
+§4b.1 Capture mode turns the next drag on either pane into a rectangle on one
+page. The region is re-rendered from the PDF at up to 3x, not grabbed from
+the screen, so small print stays legible whatever the zoom.
+
+§4b.2 A capture can be asked about (GPT tab), pasted into the note, or copied.
+The GPT tab is a per-paper conversation (`chat.json`); each question carries
+the page in view, the recent turns and the attached captures. A follow-up
+without a picture re-sends the latest captures, since every Codex run starts
+fresh.
+
 ---
 
 ## 5. TRANSLATION ENGINE
@@ -91,8 +117,9 @@ with the prompt on stdin and the answer written to a file.
 so an OpenAI-API engine or a local model is an added file rather than a change.
 
 §5.3 Translation sends the paper's *text* to OpenAI. This is stated plainly
-before the first run and is the only thing that leaves the machine — the PDF
-itself, its figures and the reader's notes never do.
+before the first run. The only other thing that goes is a capture the reader
+explicitly attached to a question (`codex exec --image`). The PDF itself and
+the reader's notes never go to OpenAI; a note goes to Notion only on export.
 
 §5.4 Results are written to disk per page as they arrive. Reopening a paper
 that was translated last week is instant and costs nothing, and a translation
@@ -109,6 +136,9 @@ interrupted halfway resumes where it stopped.
         translation.json    sentence id → Korean, with engine and model
         notes.json          free memo + anchored notes
         wordbook.json       starred words
+        chat.json           the GPT conversation
+        captures/           captures attached to questions
+        note.md, assets/    the Markdown note, until the reader moves it
         exports/
 
 ---
@@ -117,7 +147,8 @@ interrupted halfway resumes where it stopped.
 
 §7.1 No layout may shift. If Korean does not fit a rectangle, the font shrinks;
 the rectangle never grows.
-§7.2 No telemetry, no analytics, no cloud sync.
+§7.2 No telemetry, no analytics, no cloud sync. Notion export is an explicit
+export, like saving a PDF, not a sync.
 §7.3 The core (`paper_saver/core`, `pdf`, `render`) imports no Qt widgets and is
 testable without a display; `QtGui` is used only where a font metric is needed.
 §7.4 Nothing blocks the UI thread: extraction, rendering and translation all run

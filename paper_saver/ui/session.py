@@ -13,7 +13,7 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QRect, Signal
 from PySide6.QtGui import QImage
 
 from ..core.geometry import Rect
@@ -28,6 +28,10 @@ log = logging.getLogger(__name__)
 __all__ = ["PaperSession", "SentenceRef", "WordHit"]
 
 CACHE_PAGES = 14
+#: Captures are rendered at up to 3x (216 dpi), and no longer than this on
+#: their long side - sharp enough to read a subscript, small enough to upload.
+CAPTURE_SCALE = 3.0
+CAPTURE_MAX_PIXELS = 2400
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,3 +251,27 @@ class PaperSession(QObject):
                 image = original
             self._composed.put(key, image)
         return image
+
+    # -- captures ---------------------------------------------------------------
+
+    def capture(self, number: int, rect: Rect, *, translated: bool) -> QImage:
+        """A region of one page as a sharp image, for a question or a note.
+
+        Rendered afresh at a fixed resolution rather than cut out of the
+        screen, so a capture taken zoomed out still shows small print and
+        subscripts legibly - which is what GPT and the note both need. Not
+        cached: a capture is taken once.
+        """
+        width, height = self.page_size(number)
+        rect = Rect(max(0.0, rect.x0), max(0.0, rect.y0), min(width, rect.x1), min(height, rect.y1))
+        longest = max(rect.width, rect.height, 1.0)
+        scale = max(1.5, min(CAPTURE_SCALE, CAPTURE_MAX_PIXELS / longest))
+        rendered = self.document.render(number, scale)
+        image = rendered_to_qimage(rendered.samples, rendered.width, rendered.height, rendered.stride)
+        if translated:
+            try:
+                image = paint_page(image, self.layout.pages[number], self.translated_page(number), self.fonts, scale)
+            except Exception:
+                log.exception("Could not paint translated page %s for a capture", number + 1)
+        box = QRect(int(rect.x0 * scale), int(rect.y0 * scale), max(1, int(rect.width * scale)), max(1, int(rect.height * scale)))
+        return image.copy(box.intersected(image.rect()))

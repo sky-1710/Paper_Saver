@@ -56,7 +56,8 @@ from ..translate import engine_from_settings
 from ..translate.dictionary import Dictionary
 from ..translate.engine import EngineRateLimited, TranslationCancelled, TranslationEngine
 from ..translate.runner import Progress, translate_paper
-from .reader_view import ReaderView
+from .note_panel import NotionDialog
+from .reader_view import CAPTURE_KEY, ReaderView
 from .session import PaperSession
 from .workers import BackgroundTask
 
@@ -153,7 +154,7 @@ class SettingsDialog(QDialog):
         self.parallel = QSpinBox(minimum=1, maximum=6, value=int(settings.get("parallel", 3)))
         self.auto = QCheckBox("논문을 열면 자동으로 번역 시작")
         self.auto.setChecked(bool(settings.get("auto_translate", True)))
-        self.consent = QCheckBox("번역·사전에 GPT(Codex) 사용 — 논문 텍스트가 OpenAI로 전송됩니다")
+        self.consent = QCheckBox("번역·사전·질문에 GPT(Codex) 사용 — 논문 텍스트와 질문에 첨부한 캡처가 OpenAI로 전송됩니다")
         self.consent.setChecked(settings.translation_enabled)
         self.obsidian = QLineEdit(settings.get("obsidian_vocab_dir", "") or "")
         self.obsidian.setPlaceholderText("dictionary / dictionary_ko 폴더가 있는 곳 (처음 등록할 때 물어봅니다)")
@@ -162,6 +163,9 @@ class SettingsDialog(QDialog):
         form.addRow("모델", self.model)
         form.addRow("동시 요청 수", self.parallel)
         form.addRow("Obsidian 단어장", self.obsidian)
+        notion = QPushButton("Notion 연결…" + (" (연결됨)" if settings.get("notion_token") else ""))
+        notion.clicked.connect(lambda: NotionDialog(settings, self).exec())
+        form.addRow("노트 → Notion", notion)
         form.addRow(self.auto)
         form.addRow(self.consent)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -226,7 +230,10 @@ class MainWindow(QMainWindow):
         zoom_out = QAction("－", self, triggered=lambda: self.reader and self.reader.zoom_step(-1))
         zoom_in = QAction("＋", self, triggered=lambda: self.reader and self.reader.zoom_step(1))
         fit = QAction("폭 맞춤", self, triggered=lambda: self.reader and self.reader.fit_width())
-        side = QAction("사전·메모 패널", self, shortcut="Ctrl+B", triggered=lambda: self.reader and self.reader.toggle_side())
+        side = QAction("옆 패널", self, shortcut="Ctrl+B", triggered=lambda: self.reader and self.reader.toggle_side())
+        self.capture_action = QAction("✂ 캡처", self, shortcut=CAPTURE_KEY, checkable=True)
+        self.capture_action.setToolTip(f"영역을 잘라 GPT에게 묻거나 노트에 붙입니다 ({CAPTURE_KEY})")
+        self.capture_action.triggered.connect(lambda: self.reader and self.reader.toggle_capture())
 
         export_menu = QMenu(self)
         export_menu.addAction("번역본 PDF…", lambda: self.export_pdf(side_by_side=False))
@@ -262,10 +269,11 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.page_label)
         bar.addSeparator()
         bar.addAction(side)
+        bar.addAction(self.capture_action)
         self._pen_widget = bar.addWidget(self.pen_button)
         self._export_button = bar.addWidget(export_button)
         bar.addAction(settings_action)
-        self._reading_actions = [home, self.translate_action, zoom_out, zoom_in, fit, side]
+        self._reading_actions = [home, self.translate_action, zoom_out, zoom_in, fit, side, self.capture_action]
 
     def _set_reading(self, reading: bool) -> None:
         for action in self._reading_actions:
@@ -332,6 +340,7 @@ class MainWindow(QMainWindow):
         self.reader = ReaderView(self.session, self.settings, self.dictionary, self.engine)
         self.reader.statusMessage.connect(self._status)
         self.reader.pageChanged.connect(self._show_page)
+        self.reader.captureModeChanged.connect(self.capture_action.setChecked)
         self.stack.addWidget(self.reader)
         self.stack.setCurrentWidget(self.reader)
         self._set_reading(True)
@@ -385,9 +394,10 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "GPT 사용 동의",
-                "번역과 사전은 이 컴퓨터의 Codex CLI(ChatGPT 계정 로그인)를 통해 GPT를 사용합니다.\n\n"
+                "번역·사전·GPT 질문은 이 컴퓨터의 Codex CLI(ChatGPT 계정 로그인)를 통해 GPT를 사용합니다.\n\n"
                 "• 논문의 <텍스트>가 OpenAI로 전송됩니다.\n"
-                "• PDF 파일, 그림, 메모는 전송되지 않습니다.\n"
+                "• GPT 탭에서 질문할 때 직접 첨부한 캡처 이미지도 함께 전송됩니다.\n"
+                "• PDF 파일 자체와 메모·노트는 전송되지 않습니다.\n"
                 "• API 키나 별도 요금은 필요 없고, ChatGPT 사용량이 차감됩니다.\n\n"
                 "사용하시겠습니까? (설정에서 언제든 끌 수 있습니다)",
             )

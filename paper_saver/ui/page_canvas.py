@@ -11,6 +11,8 @@ the span a drag covers - works in the coordinates the layout was extracted in.
 
 The left button does two things, told apart by distance: a click looks the
 word up (§3.1), a drag highlights the text it passes over with the current pen.
+In capture mode it does a third instead: a drag draws a rectangle on one page,
+and that region is handed on to be asked about or pasted into the note.
 """
 
 from __future__ import annotations
@@ -144,6 +146,10 @@ class PageCanvas(QWidget):
     rangeHighlighted = Signal(int, list, str)
     #: The note popup was clicked: note id.
     noteClicked = Signal(str)
+    #: A capture rectangle was drawn: page, rectangle in points.
+    regionCaptured = Signal(int, object)
+    #: Capture mode was left without capturing (right click).
+    captureCancelled = Signal()
 
     def __init__(self, session: PaperSession, *, translated: bool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -163,6 +169,9 @@ class PageCanvas(QWidget):
         self._press: tuple[QPointF, int, int] | None = None
         #: The stroke in progress: page, first token, last token.
         self._stroke: tuple[int, int, int] | None = None
+        #: Capture mode, and the rectangle being drawn: page, start, end.
+        self.capture_mode = False
+        self._band: tuple[int, QPointF, QPointF] | None = None
         self._popup = _NotePopup(self)
         self._popup.clicked.connect(self.noteClicked)
         self.setMouseTracking(True)
@@ -285,7 +294,31 @@ class PageCanvas(QWidget):
             self._paint_marks(painter, placed)
             if self.translated and not self.session.translated_page(placed.number).any:
                 self._paint_pending(painter, target)
+        if self._band is not None:
+            self._paint_band(painter)
         painter.end()
+
+    def set_capture_mode(self, on: bool) -> None:
+        self.capture_mode = on
+        self._band = None
+        self._press = None
+        self._stroke = None
+        self._popup.hide()
+        self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def _band_rect(self) -> QRectF:
+        assert self._band is not None
+        number, start, end = self._band
+        placed = self._placed[number]
+        page = QRectF(placed.x, placed.y, placed.width, placed.height)
+        return QRectF(start, end).normalized().intersected(page)
+
+    def _paint_band(self, painter: QPainter) -> None:
+        band = self._band_rect()
+        painter.setPen(QPen(QColor(26, 115, 232), 1.5, Qt.PenStyle.DashLine))
+        painter.setBrush(QColor(26, 115, 232, 36))
+        painter.drawRect(band)
 
     def _rects(self, sentence_id: str) -> list[Rect]:
         return self.session.rects_of(sentence_id, translated=self.translated)
@@ -437,6 +470,11 @@ class PageCanvas(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         pos = event.position()
+        if self.capture_mode:
+            if self._band is not None:
+                self._band = (self._band[0], self._band[1], pos)
+                self.update()
+            return
         if self._press is not None and event.buttons() & Qt.MouseButton.LeftButton:
             start, number, first = self._press
             if self.pen_color and first >= 0 and (
@@ -476,6 +514,12 @@ class PageCanvas(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         hit = self._to_page(event.position())
+        if self.capture_mode:
+            if event.button() == Qt.MouseButton.RightButton:
+                self.captureCancelled.emit()
+            elif event.button() == Qt.MouseButton.LeftButton and hit is not None:
+                self._band = (hit[0], event.position(), event.position())
+            return
         if hit is None:
             return
         number, x, y = hit
@@ -494,6 +538,21 @@ class PageCanvas(QWidget):
             self._stroke = None
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.capture_mode and self._band is not None and event.button() == Qt.MouseButton.LeftButton:
+            number = self._band[0]
+            band = self._band_rect()
+            self._band = None
+            self.update()
+            placed = self._placed[number]
+            z = self.zoom
+            rect = Rect(
+                (band.left() - placed.x) / z, (band.top() - placed.y) / z,
+                (band.right() - placed.x) / z, (band.bottom() - placed.y) / z,
+            )
+            # A click, or a sliver, is not a capture.
+            if rect.width >= 4 and rect.height >= 4:
+                self.regionCaptured.emit(number, rect)
+            return
         if event.button() != Qt.MouseButton.LeftButton or self._press is None:
             return
         start, number, _ = self._press

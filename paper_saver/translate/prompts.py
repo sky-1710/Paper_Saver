@@ -19,7 +19,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-__all__ = ["SentenceRequest", "batch_prompt", "lookup_prompt", "parse_batch", "parse_lookup"]
+__all__ = ["SentenceRequest", "batch_prompt", "chat_prompt", "lookup_prompt", "parse_batch", "parse_lookup"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,3 +140,64 @@ def parse_lookup(answer: str) -> dict[str, object] | None:
         "senses": [str(s) for s in senses][:4] if isinstance(senses, list) else [],
         "note": str(payload.get("note") or ""),
     }
+
+
+# -- questions about the paper -----------------------------------------------------
+
+_CHAT_RULES = """당신은 학술 논문을 읽고 있는 사람을 돕는 연구 조교입니다. 독자의 질문에 한국어로 답하세요.
+
+규칙:
+1. 아래 논문 본문과 첨부 이미지(독자가 논문 화면에서 잘라낸 캡처)를 근거로 답하세요.
+   논문에 없는 내용을 보충할 때는 그렇다고 밝히세요. 모르면 모른다고 하세요.
+2. 캡처가 있으면 먼저 그 안의 그림·표·수식을 정확히 읽고, 그것을 짚어 가며 설명하세요.
+3. 수식은 LaTeX로 쓰세요: 문장 속은 $...$, 따로 쓰는 식은 $$...$$.
+4. 답은 Markdown으로, 핵심부터 간결하게. 필요할 때만 목록과 소제목을 쓰세요.
+5. 전문 용어는 한국어로 쓰되 처음 나올 때 괄호 안에 영어를 병기하세요.
+6. 파일을 읽거나 명령을 실행하지 마세요. 필요한 것은 모두 이 메시지 안에 있습니다.
+"""
+
+#: Caps that keep a long conversation from growing the prompt without bound.
+CHAT_PAGE_CHARS = 7000
+CHAT_HISTORY_TURNS = 10
+CHAT_TURN_CHARS = 2500
+
+
+def chat_prompt(
+    question: str,
+    *,
+    title: str = "",
+    page_label: str = "",
+    page_text: str = "",
+    history: Sequence[tuple[str, str]] = (),
+    image_notes: Sequence[str] = (),
+) -> str:
+    """One question, with the page in view and the conversation so far.
+
+    ``history`` is ``(role, text)`` pairs, role "user" or "assistant", oldest
+    first; only the last few turns are kept. ``image_notes`` describes the
+    attached images in the order they are attached.
+    """
+    parts = [_CHAT_RULES]
+    if title:
+        parts.append(f"논문 제목: {title}\n")
+    if page_text.strip():
+        text = page_text.strip()
+        if len(text) > CHAT_PAGE_CHARS:
+            text = text[:CHAT_PAGE_CHARS] + " …(이하 생략)"
+        where = f"({page_label})" if page_label else ""
+        parts.append(f"독자가 보고 있는 쪽{where}의 본문:\n<<<\n{text}\n>>>\n")
+    turns = list(history)[-CHAT_HISTORY_TURNS:]
+    if turns:
+        parts.append("지금까지의 대화:")
+        for role, text in turns:
+            text = text.strip()
+            if len(text) > CHAT_TURN_CHARS:
+                text = text[:CHAT_TURN_CHARS] + " …"
+            speaker = "독자" if role == "user" else "조교"
+            parts.append(f"[{speaker}]\n{text}\n")
+    if image_notes:
+        parts.append("첨부 이미지 (첨부된 순서대로):")
+        parts += [f"{index}. {note}" for index, note in enumerate(image_notes, start=1)]
+        parts.append("")
+    parts.append("[독자의 새 질문]\n" + (question.strip() or "첨부한 캡처를 설명해 주세요."))
+    return "\n".join(parts)

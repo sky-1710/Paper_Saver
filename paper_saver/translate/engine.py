@@ -14,16 +14,20 @@ means the text leaves the computer. That is why translation is off until
 the user turns it on, and why the confirmation before the first run says so
 plainly.
 
-What never leaves, on any path: the PDF, its figures, the notes. An
-engine is given a string and returns a string; it is not handed the project,
-its files or their paths.
+What never leaves, on any path: the PDF itself and the notes. An engine is
+given a string and returns a string; it is not handed the project, its files
+or their paths. The one exception is :meth:`TranslationEngine.ask`, which may
+also be given the capture images the reader explicitly attached to a question
+about the paper - those pictures, and nothing else of the project, go too.
 """
 
 from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 __all__ = [
     "EngineAvailability",
@@ -83,6 +87,8 @@ class TranslationEngine(ABC):
     #: An engine that runs a local model would set this False and the warning
     #: before the first run would not appear.
     sends_text_externally: bool = True
+    #: Whether :meth:`ask` can be given images along with the prompt.
+    supports_images: bool = False
 
     @abstractmethod
     def availability(self) -> EngineAvailability:
@@ -96,3 +102,13 @@ class TranslationEngine(ABC):
         :class:`TranslationCancelled` once it is set, so stopping a long
         paper takes effect in seconds rather than at the end of the batch.
         """
+
+    def ask(self, prompt: str, *, images: Sequence[Path] = (), cancel: threading.Event) -> str:
+        """A question about the paper, optionally with captured images.
+
+        Same contract as :meth:`translate`; an engine that can look at
+        pictures overrides this and sets ``supports_images``.
+        """
+        if images and not self.supports_images:
+            raise TranslationError("이 엔진은 이미지를 볼 수 없습니다. 캡처 없이 질문해 주세요.")
+        return self.translate(prompt, cancel=cancel)
