@@ -4,7 +4,8 @@ The conversation belongs to the paper and comes back when it is reopened.
 Captures wait in a strip above the input until the question is sent; a
 picture pasted into the input (Ctrl+V of a screenshot) joins them. Every
 answer carries a "노트에 넣기" link that puts the question, its captures and the
-answer into the paper's note.
+answer into the paper's note. An answer's citations show as page links;
+following one scrolls the reader to those sentences and lights them.
 
 Asking is the reader's explicit act, and it is the only way a picture of the
 paper leaves the machine (§5.3): the captures attached to that question, and
@@ -14,6 +15,7 @@ nothing else.
 from __future__ import annotations
 
 import html
+from collections.abc import Callable
 
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon, QImage, QPixmap
@@ -28,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.chat import ChatLog, ChatMessage
+from ..core.chat import ChatLog, ChatMessage, render_citations
 from .keys import CAPTURE_LABEL
 from .markdown_view import ImagePasteEdit, markdown_html
 
@@ -45,10 +47,20 @@ class ChatPanel(QWidget):
     toNoteRequested = Signal(str)
     #: A picture was pasted or dropped into the input.
     imagePasted = Signal(QImage)
+    #: Show these sentences in the reader: the ids an answer cited.
+    evidenceRequested = Signal(list)
 
-    def __init__(self, log: ChatLog, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        log: ChatLog,
+        parent: QWidget | None = None,
+        *,
+        page_of: Callable[[str], int | None] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.log = log
+        #: The page a sentence id is on, for labelling citations.
+        self._page_of = page_of or (lambda _id: None)
         self.pending: list[str] = []
         self._busy = False
         self._error = ""
@@ -133,15 +145,32 @@ class ChatPanel(QWidget):
                 f"<b style='color:#1a4fb4'>나</b>{where}<br>{text}{'<br>' + images if images else ''}"
                 "</td></tr></table>"
             )
-        body = markdown_html(message.text, None, width)
+        refs = [r for r in message.refs if self._page_of(r) is not None]
+        body = markdown_html(render_citations(message.text, refs, self._cite_link), None, width)
+        evidence = (
+            f" &nbsp;<a href='ref:{','.join(refs)}' style='font-size:9pt'>근거 문장 보기</a>" if refs else ""
+        )
         return (
             f"<p style='margin-top:10px'><b style='color:#188038'>GPT</b> "
-            f"&nbsp;<a href='note:{message.id}' style='font-size:9pt'>노트에 넣기</a></p>{body}"
+            f"&nbsp;<a href='note:{message.id}' style='font-size:9pt'>노트에 넣기</a>{evidence}</p>{body}"
         )
+
+    def _cite_link(self, ids: list[str]) -> str:
+        """Cited sentences as one Markdown link per page: " ([p.3](ref:a,b))"."""
+        pages: dict[int, list[str]] = {}
+        for sentence_id in ids:
+            page = self._page_of(sentence_id)
+            if page is not None:
+                pages.setdefault(page, []).append(sentence_id)
+        links = [f"[p.{page + 1}](ref:{','.join(group)})" for page, group in pages.items()]
+        return f" ({', '.join(links)})" if links else ""
 
     def _link(self, url: QUrl) -> None:
         if url.scheme() == "note":
             self.toNoteRequested.emit(url.path())
+            return
+        if url.scheme() == "ref":
+            self.evidenceRequested.emit([i for i in url.path().split(",") if i])
             return
         QDesktopServices.openUrl(url)
 

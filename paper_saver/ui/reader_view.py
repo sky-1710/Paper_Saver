@@ -7,7 +7,8 @@ small to fit its rectangle.
 
 Capture (Ctrl+Shift+X, ⌘⇧X on a Mac) turns the next drag on either pane into a rectangle;
 the region is rendered sharp and can be asked about in the GPT tab, pasted
-into the note, or copied.
+into the note, or copied. When GPT's answer cites sentences of the page, the
+reader scrolls to them and they stay lit until the next click on a page.
 """
 
 from __future__ import annotations
@@ -44,13 +45,13 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import Settings
-from ..core.chat import ChatLog
+from ..core.chat import ChatLog, render_citations, resolve_citations
 from ..core.geometry import Rect
 from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
 from ..core.project import HIGHLIGHT_COLORS, WordEntry
 from ..translate.dictionary import Dictionary, clean_word
 from ..translate.engine import TranslationCancelled, TranslationEngine
-from ..translate.prompts import chat_prompt
+from ..translate.prompts import chat_prompt, sentence_tag
 from .chat_panel import ChatPanel
 from .dictionary_panel import DictionaryPanel
 from .keys import CAPTURE_LABEL
@@ -141,7 +142,7 @@ class ReaderView(QWidget):
         self.notes_panel = NotesPanel(project.notes, order)
         self.wordbook_panel = WordbookPanel(project.wordbook, project.exports_dir)
         self.chat_log = ChatLog(project.root / "chat.json")
-        self.chat_panel = ChatPanel(self.chat_log)
+        self.chat_panel = ChatPanel(self.chat_log, page_of=self._page_of)
         self.note_panel = NotePanel(project, settings)
         self.side = QTabWidget()
         self.side.addTab(self.dictionary_panel, "사전")
@@ -225,12 +226,14 @@ class ReaderView(QWidget):
                 lambda page, rect, c=canvas: self._on_capture(page, rect, translated=c.translated)
             )
             canvas.captureCancelled.connect(self.cancel_capture)
+            canvas.pressed.connect(lambda: self.show_evidence([], scroll=False))
         self.chat_panel.sendRequested.connect(self.ask_gpt)
         self.chat_panel.stopRequested.connect(self.stop_gpt)
         self.chat_panel.imagePasted.connect(
             lambda image: self.chat_panel.attach(self._save_capture(image, None, "붙여 넣은 이미지"))
         )
         self.chat_panel.toNoteRequested.connect(self.answer_to_note)
+        self.chat_panel.evidenceRequested.connect(self.show_evidence)
         self.note_panel.statusMessage.connect(self.statusMessage)
 
         # Qt maps Ctrl to Cmd on a Mac, where Cmd+M minimises and Cmd+H hides
@@ -296,17 +299,36 @@ class ReaderView(QWidget):
     def current_page(self) -> int:
         return self._page
 
-    def jump_to_sentence(self, sentence_id: str) -> None:
+    def _scroll_to_sentence(self, sentence_id: str) -> bool:
         ref = self.session.sentence(sentence_id)
         if ref is None:
-            return
+            return False
         rects = ref.sentence.rects(ref.block)
         top = rects[0].y0 if rects else ref.block.rect.y0
         y = self.left.point_y(ref.page, top) - self.left_scroll.viewport().height() // 3
         self.left_scroll.verticalScrollBar().setValue(max(0, y))
+        return True
+
+    def jump_to_sentence(self, sentence_id: str) -> None:
+        if not self._scroll_to_sentence(sentence_id):
+            return
         for canvas in (self.left, self.right):
             canvas.set_focus_sentence(sentence_id)
         QTimer.singleShot(2500, lambda: [c.set_focus_sentence("") for c in (self.left, self.right)])
+
+    def show_evidence(self, sentence_ids: list[str], *, scroll: bool = True) -> None:
+        """Light the sentences a GPT answer cited, on both pages, and bring
+        the first into view; an empty list puts the lights out."""
+        ids = [i for i in sentence_ids if self.session.sentence(i) is not None]
+        for canvas in (self.left, self.right):
+            canvas.set_evidence(ids)
+        if ids and scroll:
+            self._scroll_to_sentence(ids[0])
+            self._set_pair(ids[0])
+
+    def _page_of(self, sentence_id: str) -> int | None:
+        ref = self.session.sentence(sentence_id)
+        return ref.page if ref is not None else None
 
     # -- hover pair (§2.3) -----------------------------------------------------------
 
@@ -678,9 +700,23 @@ class ReaderView(QWidget):
 
     # -- GPT --------------------------------------------------------------------------
 
-    def _page_text(self, number: int) -> str:
-        page = self.session.layout.pages[number]
-        return "\n\n".join(_plain(block.text) for block in page.blocks if block.text.strip())
+    def _page_text(self, number: int) -> tuple[str, dict[int, str]]:
+        """The page's text for GPT with every linkable sentence tagged, and
+        the sentence id each tag number stands for."""
+        numbering: dict[int, str] = {}
+        paragraphs: list[str] = []
+        for block in self.session.layout.pages[number].blocks:
+            if not block.text.strip():
+                continue
+            if not (block.translatable and block.sentences):
+                paragraphs.append(_plain(block.text))
+                continue
+            parts: list[str] = []
+            for sentence in block.sentences:
+                numbering[len(numbering) + 1] = sentence.id
+                parts.append(f"{sentence_tag(len(numbering))} {_plain(sentence.text)}")
+            paragraphs.append(" ".join(parts))
+        return "\n\n".join(paragraphs), numbering
 
     def ask_gpt(self, question: str, images: list[str]) -> None:
         if self._chat_task is not None and self._chat_task.running:
@@ -700,9 +736,10 @@ class ReaderView(QWidget):
             + self._capture_notes.get(i, "논문 화면에서 잘라낸 캡처")
             for i in attached
         ]
+        page_text, numbering = self._page_text(page)
         prompt = chat_prompt(
             question, title=self.session.project.title, page_label=f"p.{page + 1}",
-            page_text=self._page_text(page), history=history, image_notes=notes,
+            page_text=page_text, history=history, image_notes=notes, cite=bool(numbering),
         )
         message = self.chat_log.add("user", question, images=images, page=page)
         self.chat_panel.accepted()
@@ -714,9 +751,11 @@ class ReaderView(QWidget):
         # The paper may be closed before the answer comes back: the log still
         # takes it, but the panel is gone and must not be touched.
         def answered(answer: str) -> None:
-            self.chat_log.add("assistant", answer.strip())
+            text, refs = resolve_citations(answer.strip(), numbering)
+            self.chat_log.add("assistant", text, refs=refs)
             if not self._closed:
                 self.chat_panel.set_busy(False)
+                self.show_evidence(refs)
 
         def failed(exc: Exception) -> None:
             self.chat_log.remove(message.id)
@@ -745,10 +784,15 @@ class ReaderView(QWidget):
                 parts.append("> **Q.** " + question.text.strip().replace("\n", "\n> "))
             where = f"p.{question.page + 1}" if question.page is not None else ""
             parts += [self.note_panel.link_file(self.chat_log.absolute(i), where) for i in question.images]
-        parts.append(answer.text.strip())
+        parts.append(render_citations(answer.text.strip(), answer.refs, self._cite_pages))
         self.note_panel.append("\n\n".join(parts))
         self._show_tab(self.note_panel)
         self.statusMessage.emit("GPT 답변을 노트에 넣었습니다.")
+
+    def _cite_pages(self, ids: list[str]) -> str:
+        """Citations as plain text for the note: " (p.3, p.4)"."""
+        pages = dict.fromkeys(p + 1 for i in ids if (p := self._page_of(i)) is not None)
+        return f" ({', '.join(f'p.{p}' for p in pages)})" if pages else ""
 
     # -- lifetime ---------------------------------------------------------------------
 

@@ -121,6 +121,63 @@ def test_capture_note_and_chat(qapp, tmp_path: Path, two_column_pdf: Path, monke
     assert len(ChatLog(project.root / "chat.json").messages) == 4
 
 
+class _CitingEngine:
+    supports_images = True
+
+    def ask(self, prompt: str, *, images=(), cancel: threading.Event) -> str:  # type: ignore[no-untyped-def]
+        return "첫 문장이 주제를 밝힙니다 [S2]. 없는 번호 [S999]는 무시됩니다."
+
+
+def test_answer_citations_scroll_and_light_the_sentences(qapp, tmp_path: Path, two_column_pdf: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    from paper_saver.config import Settings
+    from paper_saver.ui.main_window import MainWindow, _prepare
+
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("auto_translate", False)
+    window = MainWindow(settings)
+    window.resize(1400, 900)
+    window.show()
+    project, layout = _prepare(two_column_pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    window._opened((project, layout))
+    qapp.processEvents()
+    reader = window.reader
+    reader._engine_provider = lambda: _CitingEngine()
+
+    last = reader.session.page_count - 1
+    text, numbering = reader._page_text(last)
+    assert numbering and "[S2]" in text
+    cited = numbering[2]
+    # Asked from the last page, answered while the reader is back at the top.
+    reader._page = last
+    reader.chat_panel.input.setPlainText("요점이 뭐야?")
+    reader.chat_panel.send()
+    reader.goto_page(0)
+    _wait(qapp, lambda: len(reader.chat_log.messages) == 2)
+    answer = reader.chat_log.messages[1]
+    assert answer.refs == [cited] and "S999" not in answer.text
+
+    assert reader.left._evidence == [cited] and reader.right._evidence == [cited]
+    bar = reader.left_scroll.verticalScrollBar()
+    assert bar.value() >= reader.left.page_top(last) - reader.left_scroll.viewport().height() or bar.value() == bar.maximum()
+    html = reader.chat_panel.view.toHtml()
+    assert f"ref:{cited}" in html and f"p.{last + 1}" in reader.chat_panel.view.toPlainText()
+
+    # A click on a page puts the lights out; the link brings them back.
+    reader.left.pressed.emit()
+    assert reader.left._evidence == []
+    from PySide6.QtCore import QUrl
+
+    reader.chat_panel._link(QUrl(f"ref:{cited}"))
+    assert reader.right._evidence == [cited]
+
+    reader.answer_to_note(answer.id)
+    assert "[S2]" not in reader.note_panel.editor.toPlainText()
+    assert f"주제를 밝힙니다 (p.{last + 1})." in reader.note_panel.editor.toPlainText()
+    window.close()
+
+
 def test_paste_prefers_text_over_its_picture(qapp) -> None:
     from PySide6.QtCore import QMimeData
     from PySide6.QtGui import QColor, QImage

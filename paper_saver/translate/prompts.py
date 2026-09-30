@@ -19,7 +19,15 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-__all__ = ["SentenceRequest", "batch_prompt", "chat_prompt", "lookup_prompt", "parse_batch", "parse_lookup"]
+__all__ = [
+    "SentenceRequest",
+    "batch_prompt",
+    "chat_prompt",
+    "lookup_prompt",
+    "parse_batch",
+    "parse_lookup",
+    "sentence_tag",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +164,17 @@ _CHAT_RULES = """당신은 학술 논문을 읽고 있는 사람을 돕는 연�
 6. 파일을 읽거나 명령을 실행하지 마세요. 필요한 것은 모두 이 메시지 안에 있습니다.
 """
 
+_CHAT_CITE = """7. 본문의 문장마다 [S번호] 표시가 붙어 있습니다. 답의 근거가 된 본문 문장이 있으면
+   그 내용을 말한 곳 바로 뒤에 그 표시를 그대로 붙이세요 (예: 손실을 이렇게 정의합니다 [S12]).
+   여러 문장이면 [S12][S13]처럼 따로 쓰세요. 근거가 되는 문장만, 본문에 있는 번호만 쓰세요.
+"""
+
+
+def sentence_tag(number: int) -> str:
+    """How sentence ``number`` of the page is marked for GPT to cite."""
+    return f"[S{number}]"
+
+
 #: Caps that keep a long conversation from growing the prompt without bound.
 CHAT_PAGE_CHARS = 7000
 CHAT_HISTORY_TURNS = 10
@@ -170,14 +189,16 @@ def chat_prompt(
     page_text: str = "",
     history: Sequence[tuple[str, str]] = (),
     image_notes: Sequence[str] = (),
+    cite: bool = False,
 ) -> str:
     """One question, with the page in view and the conversation so far.
 
     ``history`` is ``(role, text)`` pairs, role "user" or "assistant", oldest
     first; only the last few turns are kept. ``image_notes`` describes the
-    attached images in the order they are attached.
+    attached images in the order they are attached. With ``cite``, the page
+    text carries :func:`sentence_tag` marks and GPT is asked to cite them.
     """
-    parts = [_CHAT_RULES]
+    parts = [_CHAT_RULES + (_CHAT_CITE if cite and page_text.strip() else "")]
     if title:
         parts.append(f"논문 제목: {title}\n")
     if page_text.strip():

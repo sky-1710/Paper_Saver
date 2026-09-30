@@ -10,13 +10,20 @@ A message names its images by path relative to the project, so the folder can
 be moved or synced as a whole. Captures are written once and never rewritten;
 clearing the conversation leaves them where they are, since a note may be
 showing one of them.
+
+An answer can point at the sentences it rests on. GPT sees the page with every
+sentence tagged ``[S1]``, ``[S2]``…; those tags are page-local, so on arrival
+they are turned into the sentences' ids (:attr:`ChatMessage.refs`) and the
+text keeps only a marker ``⟦r1⟧`` naming a position in that list.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +33,7 @@ from .atomic_io import read_json, write_json_atomic
 
 log = logging.getLogger(__name__)
 
-__all__ = ["CAPTURES_DIR", "ChatLog", "ChatMessage", "capture_name"]
+__all__ = ["CAPTURES_DIR", "ChatLog", "ChatMessage", "capture_name", "render_citations", "resolve_citations"]
 
 CAPTURES_DIR = "captures"
 
@@ -57,6 +64,8 @@ class ChatMessage:
     page: int | None = None
     time: str = ""
     id: str = ""
+    #: Sentence ids an answer cites, in order; its text marks them ``⟦rN⟧``.
+    refs: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ChatMessage:
@@ -68,6 +77,7 @@ class ChatMessage:
             page=int(page) if isinstance(page, int) else None,
             time=str(data.get("time") or ""),
             id=str(data.get("id") or uuid.uuid4().hex[:10]),
+            refs=[str(r) for r in data.get("refs") or []],
         )
 
 
@@ -113,8 +123,16 @@ class ChatLog:
             data = {"messages": [asdict(m) for m in self.messages]}
         write_json_atomic(self.path, data)
 
-    def add(self, role: str, text: str, *, images: list[str] | None = None, page: int | None = None) -> ChatMessage:
-        message = ChatMessage(role, text, list(images or []), page, _now(), uuid.uuid4().hex[:10])
+    def add(
+        self,
+        role: str,
+        text: str,
+        *,
+        images: list[str] | None = None,
+        page: int | None = None,
+        refs: list[str] | None = None,
+    ) -> ChatMessage:
+        message = ChatMessage(role, text, list(images or []), page, _now(), uuid.uuid4().hex[:10], list(refs or []))
         with self._lock:
             self.messages.append(message)
         self.save()
@@ -131,7 +149,9 @@ class ChatLog:
         self.save()
 
     def history(self) -> list[tuple[str, str]]:
-        return [(m.role, m.text) for m in self.messages]
+        """The turns as GPT is shown them again: without citation markers,
+        whose sentence tags meant something only on the page asked from."""
+        return [(m.role, render_citations(m.text, m.refs, lambda _ids: "")) for m in self.messages]
 
     def question_for(self, answer_id: str) -> ChatMessage | None:
         """The user message an assistant message answered."""
@@ -154,3 +174,58 @@ class ChatLog:
             if len(found) >= limit:
                 break
         return found[-limit:]
+
+
+# -- citations ---------------------------------------------------------------------
+
+#: A tag GPT was asked to write: [S3], also [S3, S5] and [S3-S5].
+_TAG = re.compile(r"\[\s*S\d+(?:\s*[-–~,，]\s*S?\d+)*\s*\]")
+_TAG_PART = re.compile(r"S?(\d+)(?:\s*[-–~]\s*S?(\d+))?")
+#: Consecutive markers in a stored answer, with the space before them.
+_MARKERS = re.compile(r"(?:\s*⟦r\d+⟧)+")
+_MARKER = re.compile(r"⟦r(\d+)⟧")
+#: A "range" wider than this is a typo, not a citation.
+_MAX_RANGE = 8
+
+
+def resolve_citations(answer: str, numbering: Mapping[int, str]) -> tuple[str, list[str]]:
+    """GPT's ``[S3]`` tags turned into markers, and the sentence ids they name.
+
+    ``numbering`` maps a tag number to the sentence id it stood for in the
+    prompt. A tag with no such number is dropped: pointing at the wrong
+    sentence would be worse than pointing at none.
+    """
+    refs: list[str] = []
+
+    def marker(match: re.Match[str]) -> str:
+        out: list[str] = []
+        for part in _TAG_PART.finditer(match.group(0)):
+            first = int(part.group(1))
+            last = int(part.group(2)) if part.group(2) else first
+            if not 0 <= last - first <= _MAX_RANGE:
+                last = first
+            for number in range(first, last + 1):
+                sentence_id = numbering.get(number)
+                if sentence_id is None:
+                    continue
+                if sentence_id not in refs:
+                    refs.append(sentence_id)
+                out.append(f"⟦r{refs.index(sentence_id) + 1}⟧")
+        return "".join(dict.fromkeys(out))
+
+    return _TAG.sub(marker, answer), refs
+
+
+def render_citations(text: str, refs: list[str], link: Callable[[list[str]], str]) -> str:
+    """Each run of markers replaced by ``link(sentence ids)``.
+
+    The run takes the space before it along, so ``link`` decides the spacing:
+    ``" (p.3)"`` for a note, ``""`` to drop citations altogether.
+    """
+
+    def group(match: re.Match[str]) -> str:
+        ids = [refs[int(n) - 1] for n in _MARKER.findall(match.group(0)) if 0 < int(n) <= len(refs)]
+        ids = list(dict.fromkeys(ids))
+        return link(ids) if ids else ""
+
+    return _MARKERS.sub(group, text)

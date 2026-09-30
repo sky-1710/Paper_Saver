@@ -55,6 +55,32 @@ def test_chat_prompt_carries_page_history_and_images() -> None:
     assert prompt.rstrip().endswith("이 식의 의미는?")
 
 
+def test_citations_become_sentence_ids_and_leave_the_history() -> None:
+    from paper_saver.core.chat import ChatLog, render_citations, resolve_citations
+    from paper_saver.translate.prompts import chat_prompt, sentence_tag
+
+    numbering = {1: "b1s0", 2: "b1s1", 3: "b2s0", 4: "b2s1"}
+    text, refs = resolve_citations("손실을 정의합니다 [S2]. 결과는 [S3-S4], [S1, S2] 그리고 [S99].", numbering)
+    assert refs == ["b1s1", "b2s0", "b2s1", "b1s0"]
+    assert text == "손실을 정의합니다 ⟦r1⟧. 결과는 ⟦r2⟧⟦r3⟧, ⟦r4⟧⟦r1⟧ 그리고 ."
+    # A paper's own "[12]" is not a citation tag.
+    assert resolve_citations("as in [12].", numbering) == ("as in [12].", [])
+
+    grouped = render_citations(text, refs, lambda ids: f" <{'+'.join(ids)}>")
+    assert grouped == "손실을 정의합니다 <b1s1>. 결과는 <b2s0+b2s1>, <b1s0+b1s1> 그리고 ."
+    assert render_citations(text, refs, lambda _ids: "") == "손실을 정의합니다. 결과는, 그리고 ."
+
+    log = ChatLog(Path("unused.json"))
+    log.messages = []
+    log.save = lambda: None  # type: ignore[method-assign]
+    log.add("assistant", "정의 ⟦r1⟧입니다.", refs=["b1s0"])
+    assert log.history() == [("assistant", "정의입니다.")]
+
+    tagged = f"{sentence_tag(1)} We define the loss."
+    assert "[S번호]" in chat_prompt("?", page_text=tagged, cite=True)
+    assert "[S번호]" not in chat_prompt("?", page_text="We define the loss.")
+
+
 def test_codex_command_puts_images_before_the_stdin_marker(tmp_path: Path) -> None:
     from paper_saver.translate.codex_cli import CodexEngine
 

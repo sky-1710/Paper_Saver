@@ -40,6 +40,9 @@ DRAG_START = 5
 HOVER_FILL = QColor(255, 214, 0, 70)
 HOVER_EDGE = QColor(230, 160, 0, 170)
 FOCUS_FILL = QColor(66, 133, 244, 60)
+#: Sentences a GPT answer cited: the GPT tab's green.
+EVIDENCE_FILL = QColor(24, 128, 56, 48)
+EVIDENCE_EDGE = QColor(24, 128, 56, 170)
 NOTE_MARK = QColor(244, 180, 0)
 #: The standing wash on a sentence with a note: a third of the hover strength.
 NOTED_FILL = QColor(255, 214, 0, 34)
@@ -150,6 +153,8 @@ class PageCanvas(QWidget):
     regionCaptured = Signal(int, object)
     #: Capture mode was left without capturing (right click).
     captureCancelled = Signal()
+    #: The left button went down on the pages (not while capturing).
+    pressed = Signal()
 
     def __init__(self, session: PaperSession, *, translated: bool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -161,6 +166,7 @@ class PageCanvas(QWidget):
         self._placed: list[_Placed] = []
         self._hover = ""
         self._focus = ""
+        self._evidence: list[str] = []
         self._notes: dict[str, list[MarginNote]] = {}
         #: Reader's sentence highlights: sentence id -> colour.
         self._marks: dict[str, QColor] = {}
@@ -243,6 +249,12 @@ class PageCanvas(QWidget):
     def set_focus_sentence(self, sentence_id: str) -> None:
         self._focus = sentence_id
         self.update()
+
+    def set_evidence(self, sentence_ids: list[str]) -> None:
+        """Sentences a GPT answer rests on; they stay lit until replaced."""
+        if sentence_ids != self._evidence:
+            self._evidence = list(sentence_ids)
+            self.update()
 
     def set_highlights(self, colors: dict[str, str]) -> None:
         marks: dict[str, QColor] = {}
@@ -363,6 +375,7 @@ class PageCanvas(QWidget):
                 painter.drawRect(self._to_widget(placed, rect.inflated(0.4, 0.2)))
 
         for sentence_id, fill, edge in (
+            *((s, EVIDENCE_FILL, EVIDENCE_EDGE) for s in self._evidence),
             (self._focus, FOCUS_FILL, None),
             (self._hover, HOVER_FILL, HOVER_EDGE),
         ):
@@ -534,6 +547,7 @@ class PageCanvas(QWidget):
                 self.sentenceMenu.emit(sentence_id, global_pos)
             return
         if event.button() == Qt.MouseButton.LeftButton:
+            self.pressed.emit()
             self._press = (event.position(), number, self._token_at(number, x, y))
             self._stroke = None
 
