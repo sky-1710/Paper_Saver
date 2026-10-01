@@ -45,3 +45,30 @@ def test_open_hover_and_paint(qapp, tmp_path: Path, two_column_pdf: Path, monkey
     image = window.grab()
     assert not image.isNull()
     window.close()
+
+
+def test_exported_pdf_keeps_searchable_text(qapp, tmp_path: Path, two_column_pdf: Path) -> None:
+    import pymupdf
+
+    from paper_saver.render.export import translated_pdf
+    from paper_saver.ui.main_window import _prepare
+
+    project, layout = _prepare(two_column_pdf, None, tmp_path / "projects")(threading.Event(), lambda _m: None)
+    first, *_ = [(s.id, s.text) for _, _, s in layout.sentences()]
+    project.translations.update({first[0]: "합성 논문에 대한 연구"})
+    with pymupdf.open(two_column_pdf) as source:
+        original = source[0].get_text()
+        untouched = next(w[4] for w in source[0].get_text("words") if w[4] not in first[1] and w[4].isalpha())
+
+    for side_by_side in (False, True):
+        target = tmp_path / f"out-{side_by_side}.pdf"
+        translated_pdf(project, layout, target, side_by_side=side_by_side)
+        with pymupdf.open(target) as document:
+            page = document[0]
+            text = page.get_text()
+            assert "합성 논문에 대한 연구" in text  # the Korean can be found
+            assert page.search_for("합성 논문")
+            assert untouched in text  # and so can what was left as the original
+            if side_by_side:
+                left = page.get_text(clip=pymupdf.Rect(0, 0, page.rect.width / 2 - 9, page.rect.height))
+                assert left.split() == original.split()  # the paper's own page, text and all
