@@ -1,6 +1,6 @@
 [project]
 name = "paper-saver"
-version = "0.2.1"
+version = "0.3.0"
 description = "Side-by-side paper reader with a layout-faithful Korean translation"
 requires-python = ">=3.10"
 
