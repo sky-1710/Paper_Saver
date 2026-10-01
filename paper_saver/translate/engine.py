@@ -25,9 +25,10 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 __all__ = [
     "EngineAvailability",
@@ -112,3 +113,19 @@ class TranslationEngine(ABC):
         if images and not self.supports_images:
             raise TranslationError("이 엔진은 이미지를 볼 수 없습니다. 캡처 없이 질문해 주세요.")
         return self.translate(prompt, cancel=cancel)
+
+    def generate_json(
+        self,
+        prompt: str,
+        schema: Mapping[str, Any],
+        *,
+        images: Sequence[Path] = (),
+        cancel: threading.Event,
+    ) -> str:
+        """An answer that should be JSON matching ``schema``, as text.
+
+        An engine that can hold the model to a schema does so; the rest rely
+        on the prompt. Either way the caller parses and validates the result -
+        the schema makes a malformed answer rarer, not impossible.
+        """
+        return self.ask(prompt, images=images, cancel=cancel)

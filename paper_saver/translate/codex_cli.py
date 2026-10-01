@@ -32,6 +32,10 @@ Every flag there is load-bearing:
     They go first, straight after ``exec``: the option takes any number of
     values, and the next ``--flag`` is what ends the list - put last, it
     would swallow the ``-`` that means "prompt on stdin".
+``--output-schema FILE`` (quizzes only)
+    A JSON Schema the final answer is held to. The file is written by Paper
+    Saver into the scratch folder; nothing the reader typed or uploaded is
+    ever part of a command line, only the fixed paths Paper Saver chose.
 ``--ignore-user-config``
     ``~/.codex/config.toml`` is set up for whatever the user does with Codex
     otherwise, and none of it belongs in a translation. Two parts actively
@@ -47,13 +51,14 @@ cp949 here, which mangles Korean.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -230,7 +235,9 @@ class CodexEngine(TranslationEngine):
         version = (result.stdout or result.stderr).strip().splitlines()
         return EngineAvailability(ready=True, detail=version[0] if version else str(path))
 
-    def _command(self, path: Path, answer_file: Path, images: Sequence[Path] = ()) -> list[str]:
+    def _command(
+        self, path: Path, answer_file: Path, images: Sequence[Path] = (), schema_file: Path | None = None
+    ) -> list[str]:
         cmd = [str(path), "exec"]
         for image in images:
             cmd += ["--image", str(image)]
@@ -242,6 +249,8 @@ class CodexEngine(TranslationEngine):
             "--color", "never",
             "--output-last-message", str(answer_file),
         ]
+        if schema_file is not None:
+            cmd += ["--output-schema", str(schema_file)]
         if self.model:
             cmd += ["-m", self.model]
         # A trailing "-" tells Codex the prompt arrives on stdin.
@@ -256,7 +265,27 @@ class CodexEngine(TranslationEngine):
             raise TranslationError("첨부한 캡처 파일을 찾을 수 없습니다:\n" + "\n".join(missing))
         return self._run(prompt, [Path(p).resolve() for p in images], cancel)
 
-    def _run(self, prompt: str, images: Sequence[Path], cancel: threading.Event) -> str:
+    def generate_json(
+        self,
+        prompt: str,
+        schema: Mapping[str, Any],
+        *,
+        images: Sequence[Path] = (),
+        cancel: threading.Event,
+    ) -> str:
+        missing = [str(p) for p in images if not Path(p).is_file()]
+        if missing:
+            raise TranslationError("첨부할 이미지 파일을 찾을 수 없습니다:\n" + "\n".join(missing))
+        return self._run(prompt, [Path(p).resolve() for p in images], cancel, schema=schema)
+
+    def _run(
+        self,
+        prompt: str,
+        images: Sequence[Path],
+        cancel: threading.Event,
+        *,
+        schema: Mapping[str, Any] | None = None,
+    ) -> str:
         path = self.resolve()
         # Codex treats its working directory as the workspace root. A scratch
         # folder keeps it away from the paper project and from whatever
@@ -267,9 +296,13 @@ class CodexEngine(TranslationEngine):
         with tempfile.TemporaryDirectory(prefix="paper-saver-translate-", ignore_cleanup_errors=True) as scratch:
             workspace = Path(scratch)
             answer_file = workspace / "answer.md"
+            schema_file = None
+            if schema is not None:
+                schema_file = workspace / "schema.json"
+                schema_file.write_text(json.dumps(schema), encoding="utf-8")
             try:
                 process = subprocess.Popen(
-                    self._command(path, answer_file, images),
+                    self._command(path, answer_file, images, schema_file),
                     cwd=str(workspace),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,

@@ -107,6 +107,33 @@ fresh.
 
 ---
 
+## 4c. SLIDE QUIZZES
+
+§4c.1 A lecture PDF opened in Paper Saver is a slide deck: each page is a
+slide. The 퀴즈 tab follows the page in view and, on the reader's press,
+writes three True/False questions for that slide — one Easy (a definition or
+property stated on the slide), one Medium (one key term, condition or cause
+swapped into a plausible misconception), one Hard (concepts combined, a
+condition judged, a small calculation or scenario).
+
+§4c.2 Materials are kept apart and named as what they are: the slides (the
+open PDF, never uploaded separately), the lecture's STT (optional; PDF, txt,
+md, srt, vtt), and the professor's earlier quizzes, used for *style only*.
+Registered files are copied into `quiz/materials/` with their text beside them.
+
+§4c.3 Only one slide's context is sent: its text, the STT sections matched to
+it, and the extracted style examples. STT sections are matched to pages by
+shared words in lecture order, since Lecture Saver's "Slide N" counts screen
+changes, not PDF pages. Questions must stay inside the slide and its STT.
+
+§4c.4 Codex answers JSON held to a schema (`--output-schema`); the answer is
+validated (one question per difficulty, complete fields, a hint that does not
+give the answer away) and retried once with the reason before failing. A
+slide's quiz and the reader's answers are kept in `quiz.json` until the
+reader presses Regenerate.
+
+---
+
 ## 5. TRANSLATION ENGINE
 
 §5.1 Translation goes through the Codex CLI, signed in with the user's ChatGPT
@@ -118,8 +145,10 @@ so an OpenAI-API engine or a local model is an added file rather than a change.
 
 §5.3 Translation sends the paper's *text* to OpenAI. This is stated plainly
 before the first run. The only other thing that goes is a capture the reader
-explicitly attached to a question (`codex exec --image`). The PDF itself and
-the reader's notes never go to OpenAI; a note goes to Notion only on export.
+explicitly attached to a question (`codex exec --image`), and, for a quiz, the
+slide's text, its matched STT excerpt and the style examples — plus the
+slide's picture only if the reader turned that on. The PDF itself and the
+reader's notes never go to OpenAI; a note goes to Notion only on export.
 
 §5.4 Results are written to disk per page as they arrive. Reopening a paper
 that was translated last week is instant and costs nothing, and a translation
@@ -138,6 +167,8 @@ interrupted halfway resumes where it stopped.
         wordbook.json       starred words
         chat.json           the GPT conversation
         captures/           captures attached to questions
+        quiz.json           slide quizzes, answers, the list of quiz materials
+        quiz/materials/     the STT and style references, copied in, with their text
         note.md, assets/    the Markdown note, until the reader moves it
         exports/
 

@@ -57,6 +57,7 @@ API 키를 쓰지 않습니다. OpenAI의 **Codex CLI**를 백그라운드에서
 | GPT | 논문에 대해 묻는 채팅. 보고 있는 쪽의 본문과 대화 기록, 첨부한 캡처가 함께 전달됩니다. 스크린샷을 입력칸에 Ctrl+V 해도 첨부됩니다. 사진 없이 이어 묻는 질문에는 직전 캡처를 다시 보냅니다. 답마다 `노트에 넣기`(질문·캡처·답을 노트 끝에 추가). 대화는 논문별로 저장됩니다. |
 | 노트 | 논문별 Markdown 노트(.md). 기본은 프로젝트 폴더의 `note.md`이고 `파일 ▾ → 다른 곳에 저장`으로 Obsidian 볼트 등 **아무 곳에나** 옮길 수 있습니다(링크된 이미지도 함께 복사). 캡처·붙여 넣은 이미지는 노트 옆 `assets/`에 저장되고 `![p.3 원문](assets/…png)`로 링크됩니다. 자동 저장, `미리보기`로 이미지와 함께 보기. 다른 프로그램에서 고친 내용은 덮어쓰지 않고 따로 보관합니다. |
 | Notion | 노트의 `Notion으로` → 이미지까지 올려 지정한 Notion 페이지 아래에 새 페이지로 만듭니다(제목·목록·표·코드·수식·콜아웃 변환). 다시 보내면 이전 페이지를 Notion 휴지통으로 보내고 바꿀 수 있습니다. 처음에 통합(integration) 시크릿과 대상 페이지 링크를 묻습니다. |
+| 퀴즈 | 강의 슬라이드 PDF를 열면 `퀴즈` 탭이 보고 있는 슬라이드의 O/X 문제 3개(Easy·Medium·Hard)를 만듭니다. 자료는 ① 슬라이드(지금 연 PDF) ② 강의 STT(선택 · PDF/txt/md/srt/vtt, Lecture Saver 내보내기 그대로) ③ 교수님 이전 퀴즈(문체 참고용)로 나뉩니다. STT는 슬라이드마다 해당 구간을 찾아 함께 보냅니다. 답을 고르면 정답 여부·내 답·정답·해설, `Hint`는 답을 알려 주지 않는 단서. 만든 퀴즈와 풀이는 저장되어 `Regenerate Quiz`를 누를 때만 새로 만듭니다. JSON 내보내기/가져오기. |
 | 내보내기 | 번역본 PDF, 원문·번역 나란히 PDF, 메모·단어장 Markdown. |
 
 번역은 지금 보고 있는 쪽부터 3개 요청을 동시에 진행하고, 끝난 부분은 즉시 저장·표시됩니다. 중간에 멈춰도 다시 시작하면 남은 문장만 번역합니다.
@@ -69,12 +70,12 @@ Ctrl+O 열기 · Ctrl+T 번역 시작/중지 · Ctrl+Shift+X 캡처 · Ctrl+M �
 
 ## 저장 위치
 
-`문서\Paper Saver\Papers\<논문 제목>\` (맥: `~/Documents/Paper Saver/Papers/`) — `paper.pdf`, `layout.json`, `translation.json`, `notes.json`, `highlights.json`, `wordbook.json`, `chat.json`, `captures\`, `note.md`·`assets\`(노트를 옮기지 않았다면), `exports\`.
+`문서\Paper Saver\Papers\<논문 제목>\` (맥: `~/Documents/Paper Saver/Papers/`) — `paper.pdf`, `layout.json`, `translation.json`, `notes.json`, `highlights.json`, `wordbook.json`, `chat.json`, `captures\`, `quiz.json`·`quiz\materials\`, `note.md`·`assets\`(노트를 옮기지 않았다면), `exports\`.
 같은 PDF를 다시 열면(파일 해시 기준) 기존 프로젝트를 그대로 엽니다. 사전 캐시와 설정은 `%APPDATA%\PaperSaver\` (맥: `~/Library/Application Support/PaperSaver/`).
 
 ## 개인정보
 
-GPT로 전송되는 것은 **논문 텍스트**와, GPT 탭에서 질문할 때 **직접 첨부한 캡처**뿐입니다(처음 사용할 때 동의를 묻고, 설정에서 끌 수 있음). PDF 파일 자체와 메모·노트는 전송되지 않습니다. 노트는 `Notion으로`를 누를 때만 Notion으로 전송됩니다.
+GPT로 전송되는 것은 **논문 텍스트**와, GPT 탭에서 질문할 때 **직접 첨부한 캡처**, 퀴즈를 만들 때 **그 슬라이드의 텍스트·해당 STT 구간·이전 퀴즈 예시**(켜 두면 슬라이드 이미지)뿐입니다(처음 사용할 때 동의를 묻고, 설정에서 끌 수 있음). PDF 파일 자체와 메모·노트는 전송되지 않습니다. 노트는 `Notion으로`를 누를 때만 Notion으로 전송됩니다.
 
 ## 레이아웃 분석 점검
 

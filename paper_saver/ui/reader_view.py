@@ -13,6 +13,7 @@ reader scrolls to them and they stay lit until the next click on a page.
 
 from __future__ import annotations
 
+import copy
 import re
 import sys
 from collections.abc import Callable
@@ -47,11 +48,24 @@ from PySide6.QtWidgets import (
 from ..config import Settings
 from ..core.chat import ChatLog, render_citations, resolve_citations
 from ..core.geometry import Rect
+from ..core.lecture import (
+    SlideDeck,
+    align_transcript,
+    extract_quiz_examples,
+    format_quiz_examples,
+    parse_transcript,
+    transcript_excerpt,
+)
 from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
 from ..core.project import HIGHLIGHT_COLORS, WordEntry
+from ..core.quiz import QuizStore, id_prefix
+from ..pdf.document import PaperDocument
+from ..pdf.text import MaterialError, read_pages
+from ..render.quiz_pdf import PLACEMENTS, quiz_pdf, slides_quiz_pdf
 from ..translate.dictionary import Dictionary, clean_word
-from ..translate.engine import TranslationCancelled, TranslationEngine
+from ..translate.engine import TranslationCancelled, TranslationEngine, TranslationError
 from ..translate.prompts import chat_prompt, sentence_tag
+from ..translate.quiz import CodexQuizGenerator, QuizGenerationInput
 from .chat_panel import ChatPanel
 from .dictionary_panel import DictionaryPanel
 from .keys import CAPTURE_LABEL
@@ -59,6 +73,7 @@ from .markdown_view import save_png
 from .note_panel import NotePanel
 from .notes_panel import NotesPanel
 from .page_canvas import MARGIN, MarginNote, PageCanvas, RangeMark
+from .quiz_panel import QuizPanel
 from .session import PaperSession
 from .wordbook_panel import WordbookPanel
 from .workers import BackgroundTask
@@ -144,9 +159,21 @@ class ReaderView(QWidget):
         self.chat_log = ChatLog(project.root / "chat.json")
         self.chat_panel = ChatPanel(self.chat_log, page_of=self._page_of)
         self.note_panel = NotePanel(project, settings)
+        self.quiz_store = QuizStore(project.root)
+        self.quiz_panel = QuizPanel(
+            self.quiz_store, session.page_count,
+            Path(str(project.meta.get("source") or project.pdf_path)).name,
+            project.exports_dir, project.title,
+        )
+        self._deck: SlideDeck | None = None
+        self._deck_task: BackgroundTask | None = None
+        self._quiz_task: BackgroundTask | None = None
+        self._material_task: BackgroundTask | None = None
+        self._quiz_pdf_task: BackgroundTask | None = None
         self.side = QTabWidget()
         self.side.addTab(self.dictionary_panel, "사전")
         self.side.addTab(self.chat_panel, "GPT")
+        self.side.addTab(self.quiz_panel, "퀴즈")
         self.side.addTab(self.note_panel, "노트")
         self.side.addTab(self.notes_panel, "메모")
         self.side.addTab(self.wordbook_panel, "단어장")
@@ -236,6 +263,14 @@ class ReaderView(QWidget):
         self.chat_panel.evidenceRequested.connect(self.show_evidence)
         self.note_panel.statusMessage.connect(self.statusMessage)
 
+        self.quiz_panel.generateRequested.connect(self.generate_quiz)
+        self.quiz_panel.stopRequested.connect(self.stop_quiz)
+        self.quiz_panel.slideRequested.connect(self._show_slide)
+        self.quiz_panel.transcriptChosen.connect(self._register_transcript)
+        self.quiz_panel.stylesChosen.connect(self._register_styles)
+        self.quiz_panel.pdfExportRequested.connect(self.export_quiz_pdf)
+        self.side.currentChanged.connect(lambda _i: self.side.currentWidget() is self.quiz_panel and self._load_deck())
+
         # Qt maps Ctrl to Cmd on a Mac, where Cmd+M minimises and Cmd+H hides
         # the application before the window ever sees the key - so the Mac
         # gets Shift added. See NOTE_KEY / HIGHLIGHT_KEY.
@@ -294,6 +329,7 @@ class ReaderView(QWidget):
         if page != self._page:
             self._page = page
             self.pageChanged.emit(page)
+            self.quiz_panel.set_slide(page + 1)
 
     @property
     def current_page(self) -> int:
@@ -794,6 +830,202 @@ class ReaderView(QWidget):
         pages = dict.fromkeys(p + 1 for i in ids if (p := self._page_of(i)) is not None)
         return f" ({', '.join(f'p.{p}' for p in pages)})" if pages else ""
 
+    # -- quiz (§4c) ------------------------------------------------------------------
+
+    def _show_slide(self, slide: int) -> None:
+        """The quiz tab's slide buttons: scroll there, and make sure the tab
+        follows even where the last page cannot be scrolled to the top."""
+        self.goto_page(slide - 1)
+        self.quiz_panel.set_slide(slide)
+
+    def _load_deck(self) -> None:
+        """Read every slide's text once, for the titles the quiz tab shows."""
+        if self._deck is not None or (self._deck_task is not None and self._deck_task.running):
+            return
+        pdf = self.session.project.pdf_path
+
+        def work(_cancel, _report):  # type: ignore[no-untyped-def]
+            return SlideDeck(read_pages(pdf))
+
+        task = BackgroundTask(work, name="slides")
+        task.succeeded.connect(self._deck_loaded)
+        self._deck_task = task.start()
+
+    def _deck_loaded(self, deck: SlideDeck) -> None:
+        self._deck = deck
+        if not self._closed:
+            self.quiz_panel.set_titles({page + 1: title for page, title in deck.titles().items()})
+
+    def generate_quiz(self, slide: int) -> None:
+        if self._quiz_task is not None and self._quiz_task.running:
+            return
+        engine = self._engine_provider()
+        if engine is None:
+            self.quiz_panel.set_error(slide, "GPT 사용에 동의하고 Codex가 설치되어 있어야 퀴즈를 만들 수 있습니다.")
+            return
+        project, store = self.session.project, self.quiz_store
+        pdf, deck = project.pdf_path, self._deck
+        transcript, styles = store.transcript_text(), store.style_text()
+        image_path = store.root / QuizStore.FOLDER / "slides" / f"slide-{slide}.png" if store.send_slide_image else None
+        prefix, lecture = id_prefix(project.title), project.title
+
+        def work(cancel, _report):  # type: ignore[no-untyped-def]
+            slides = deck or SlideDeck(read_pages(pdf))
+            page = slide - 1
+            content = slides.content(page)
+            excerpt = section = ""
+            if transcript.strip():
+                sections = parse_transcript(transcript)
+                excerpt, section = transcript_excerpt(sections, align_transcript(slides.pages, sections).get(page, []))
+            if not content.strip() and not excerpt.strip() and image_path is None:
+                raise TranslationError(
+                    "이 슬라이드에서 텍스트를 찾지 못했고 연결된 STT도 없습니다.\n"
+                    "그림뿐인 슬라이드라면 자료에서 '슬라이드 이미지도 함께 보내기'를 켜 주세요."
+                )
+            image = None
+            if image_path is not None:
+                with PaperDocument(pdf) as document:
+                    image = document.save_png(page, image_path)
+            request = QuizGenerationInput(
+                slide_number=slide, slide_title=slides.title(page), slide_content=content,
+                transcript_content=excerpt, transcript_section=section, quiz_style_examples=styles,
+                lecture_title=lecture, slide_image=image, id_prefix=prefix,
+            )
+            return slides, CodexQuizGenerator(engine).generate_slide_quiz(request, cancel=cancel)
+
+        def finished(result) -> None:  # type: ignore[no-untyped-def]
+            slides, quiz = result
+            store.put(quiz)
+            if self._deck is None:
+                self._deck_loaded(slides)
+            if not self._closed:
+                self.quiz_panel.set_generating(None)
+                self.statusMessage.emit(f"Slide {slide} 퀴즈를 만들었습니다.")
+
+        def failed(exc: Exception) -> None:
+            if self._closed:
+                return
+            self.quiz_panel.set_generating(None)
+            if isinstance(exc, TranslationCancelled):
+                self.statusMessage.emit("퀴즈 생성을 멈췄습니다.")
+            else:
+                self.quiz_panel.set_error(slide, str(exc))
+
+        task = BackgroundTask(work, name="quiz")
+        task.succeeded.connect(finished)
+        task.failed.connect(failed)
+        self.quiz_panel.set_generating(slide)
+        self._quiz_task = task.start()
+
+    def stop_quiz(self) -> None:
+        if self._quiz_task is not None and self._quiz_task.running:
+            self._quiz_task.cancel()
+
+    def export_quiz_pdf(self, path: str, layout: str = "quiz") -> None:
+        """Every slide's quiz in one PDF, then the answers.
+
+        ``layout`` is "quiz" for the questions alone, or "right" / "below" for
+        every slide with its questions set beside or under it.
+        """
+        if self._quiz_pdf_task is not None and self._quiz_pdf_task.running:
+            return
+        store = self.quiz_store
+        quizzes, attempts = dict(store.quizzes), {n: copy.deepcopy(a) for n, a in store.attempts.items()}
+        titles = self._deck.titles() if self._deck is not None else {}
+        titles = {page + 1: title for page, title in titles.items()}
+        target, lecture, slides = Path(path), self.session.project.title, self.session.project.pdf_path
+
+        def work(_cancel, _report):  # type: ignore[no-untyped-def]
+            if layout in PLACEMENTS:
+                return slides_quiz_pdf(
+                    slides, quizzes, target, placement=layout, lecture=lecture, attempts=attempts, titles=titles
+                )
+            return quiz_pdf(quizzes, target, lecture=lecture, attempts=attempts, titles=titles)
+
+        def finished(count: int) -> None:
+            if self._closed:
+                return
+            self.quiz_panel.set_pdf_busy(False, f"퀴즈 {count}개 슬라이드를 PDF로 저장했습니다: {target}")
+            self.statusMessage.emit(f"퀴즈 PDF를 저장했습니다: {target.name}")
+
+        def failed(exc: Exception) -> None:
+            if self._closed:
+                return
+            self.quiz_panel.set_pdf_busy(False, "")
+            QMessageBox.warning(self, "퀴즈 PDF", f"PDF를 만들지 못했습니다.\n\n{exc}")
+
+        task = BackgroundTask(work, name="quiz-pdf")
+        task.succeeded.connect(finished)
+        task.failed.connect(failed)
+        self.quiz_panel.set_pdf_busy(True, "퀴즈 PDF를 만드는 중…")
+        self._quiz_pdf_task = task.start()
+
+    def _material_running(self) -> bool:
+        if self._material_task is not None and self._material_task.running:
+            self.quiz_panel.materials_status.setText("앞의 자료를 읽는 중입니다. 잠시 후 다시 시도하세요.")
+            return True
+        return False
+
+    def _register_transcript(self, path: str) -> None:
+        """Read the STT off the UI thread, copy it in, and say what was found."""
+        if self._material_running():
+            return
+        store, source = self.quiz_store, Path(path)
+
+        def work(_cancel, _report):  # type: ignore[no-untyped-def]
+            text = "\n".join(read_pages(source))
+            if not text.strip():
+                raise MaterialError(f"'{source.name}'에서 텍스트를 찾지 못했습니다. (스캔한 PDF라면 텍스트 PDF나 txt로 바꿔 주세요)")
+            sections = parse_transcript(text)
+            return store.import_material(source, text), sections
+
+        def finished(result) -> None:  # type: ignore[no-untyped-def]
+            material, sections = result
+            store.set_transcript(material)
+            slides = sum(1 for s in sections if s.number is not None)
+            found = f"슬라이드 표시 {slides}개 구간" if slides else f"{len(sections)}개 구간 (슬라이드 표시 없음 · 내용으로 연결)"
+            if not self._closed:
+                self.quiz_panel.set_material_busy(False, f"STT 등록: {material.name} — {found}")
+
+        self._run_material(work, finished, "STT를 읽는 중…")
+
+    def _register_styles(self, paths: list) -> None:
+        if self._material_running():
+            return
+        store = self.quiz_store
+
+        def work(_cancel, _report):  # type: ignore[no-untyped-def]
+            added = []
+            for path in paths:
+                source = Path(path)
+                pages = read_pages(source)
+                examples = extract_quiz_examples(pages)
+                text = format_quiz_examples(examples, fallback="\n".join(pages))
+                if not text.strip():
+                    raise MaterialError(f"'{source.name}'에서 텍스트를 찾지 못했습니다.")
+                added.append((store.import_material(source, text), len(examples)))
+            return added
+
+        def finished(added) -> None:  # type: ignore[no-untyped-def]
+            for material, _count in added:
+                store.add_style(material)
+            summary = ", ".join(f"{m.name} (문제 {n}개 인식)" if n else f"{m.name} (문항 형식 없음 · 본문 일부 사용)" for m, n in added)
+            if not self._closed:
+                self.quiz_panel.set_material_busy(False, f"스타일 참고 추가: {summary}")
+
+        self._run_material(work, finished, "이전 퀴즈를 읽는 중…")
+
+    def _run_material(self, work, finished, message: str) -> None:  # type: ignore[no-untyped-def]
+        def failed(exc: Exception) -> None:
+            if not self._closed:
+                self.quiz_panel.set_material_busy(False, str(exc) if isinstance(exc, MaterialError) else f"자료를 읽지 못했습니다: {exc}")
+
+        task = BackgroundTask(work, name="quiz-material")
+        task.succeeded.connect(finished)
+        task.failed.connect(failed)
+        self.quiz_panel.set_material_busy(True, message)
+        self._material_task = task.start()
+
     # -- lifetime ---------------------------------------------------------------------
 
     def shutdown(self) -> None:
@@ -802,6 +1034,7 @@ class ReaderView(QWidget):
         self.notes_panel.save_memo()
         self.note_panel.shutdown()
         self.stop_gpt()
+        self.stop_quiz()
         if self._lookup_task is not None:
             self._lookup_task.cancel()
 

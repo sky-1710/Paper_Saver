@@ -111,6 +111,13 @@ class PaperDocument:
             zoom=zoom,
         )
 
+    def save_png(self, number: int, path: Path, zoom: float = 1.5) -> Path:
+        """A page as a PNG file - a slide attached to a quiz request."""
+        pixmap = self._doc[number].get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pixmap.save(str(path))
+        return path
+
     # -- what to call this paper --------------------------------------------
 
     def title(self) -> str:

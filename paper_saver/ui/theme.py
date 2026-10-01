@@ -22,5 +22,27 @@ QPushButton#primary:hover { background: #1765cc; }
 QProgressBar { border: 1px solid #cfd4da; border-radius: 4px; text-align: center; height: 16px; background: #fff; }
 QProgressBar::chunk { background: #34a853; border-radius: 3px; }
 QListWidget, QTableWidget, QPlainTextEdit, QTextBrowser, QLineEdit { border: 1px solid #dfe2e6; border-radius: 4px; }
+QFrame#quizMaterials { background: #f8f9fb; border: 1px solid #e3e6ea; border-radius: 6px; }
+QLabel#materialKind { font-weight: 600; color: #1a4fb4; padding-top: 4px; }
+QLabel#quizSlide { font-size: 12pt; font-weight: 700; color: #202124; }
+QLabel#quizTitle { font-size: 11pt; color: #3c4043; }
+QLabel#quizLead { font-size: 11pt; font-weight: 600; color: #202124; }
+QLabel#quizScore { font-weight: 600; color: #1a4fb4; }
+QLabel#quizError { font-size: 11pt; font-weight: 600; color: #c5221f; }
+QFrame#quizCard { background: #fff; border: 1px solid #dfe2e6; border-radius: 8px; }
+QFrame#quizCard[result="right"] { border: 1px solid #34a853; }
+QFrame#quizCard[result="wrong"] { border: 1px solid #d93025; }
+QFrame#quizResult { background: #eef3fd; border: 1px solid #c6d6f5; border-radius: 8px; }
+QLabel#quizNumber { font-weight: 600; color: #5f6368; }
+QLabel#quizQuestion { font-family: 'Georgia', 'Times New Roman', serif; font-size: 11pt; color: #202124; }
+QLabel#quizHint { background: #fef7e0; border-radius: 4px; padding: 5px 7px; color: #6b4e00; }
+QLabel#quizRight { font-weight: 700; color: #137333; }
+QLabel#quizWrong { font-weight: 700; color: #c5221f; }
+QLabel#quizExplainTitle { font-weight: 600; color: #3c4043; }
+QLabel#quizExplain { color: #3c4043; }
+QPushButton#quizChoice { font-size: 13pt; font-weight: 700; min-width: 64px; padding: 5px 0; }
+QPushButton#quizPrimary { background: #1a73e8; color: white; border-color: #1a73e8; padding: 7px 18px; font-weight: 600; }
+QPushButton#quizPrimary:hover { background: #1765cc; }
+QPushButton#quizPrimary:disabled { background: #a8c7fa; border-color: #a8c7fa; }
 QPlainTextEdit { font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Menlo', 'Consolas', monospace; }
 """

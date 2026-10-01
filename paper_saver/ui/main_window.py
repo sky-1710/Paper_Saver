@@ -58,6 +58,7 @@ from ..translate.engine import EngineRateLimited, TranslationCancelled, Translat
 from ..translate.runner import Progress, translate_paper
 from .keys import CAPTURE_KEY, CAPTURE_LABEL
 from .note_panel import NotionDialog
+from .quiz_panel import PDF_LAYOUTS
 from .reader_view import ReaderView
 from .session import PaperSession
 from .workers import BackgroundTask
@@ -155,7 +156,7 @@ class SettingsDialog(QDialog):
         self.parallel = QSpinBox(minimum=1, maximum=6, value=int(settings.get("parallel", 3)))
         self.auto = QCheckBox("논문을 열면 자동으로 번역 시작")
         self.auto.setChecked(bool(settings.get("auto_translate", True)))
-        self.consent = QCheckBox("번역·사전·질문에 GPT(Codex) 사용 — 논문 텍스트와 질문에 첨부한 캡처가 OpenAI로 전송됩니다")
+        self.consent = QCheckBox("번역·사전·질문·퀴즈에 GPT(Codex) 사용 — 논문·강의 텍스트와 질문에 첨부한 캡처가 OpenAI로 전송됩니다")
         self.consent.setChecked(settings.translation_enabled)
         self.obsidian = QLineEdit(settings.get("obsidian_vocab_dir", "") or "")
         self.obsidian.setPlaceholderText("dictionary / dictionary_ko 폴더가 있는 곳 (처음 등록할 때 물어봅니다)")
@@ -240,6 +241,11 @@ class MainWindow(QMainWindow):
         export_menu.addAction("번역본 PDF…", lambda: self.export_pdf(side_by_side=False))
         export_menu.addAction("원문·번역 나란히 PDF…", lambda: self.export_pdf(side_by_side=True))
         export_menu.addAction("메모·단어장 Markdown…", self.export_notes)
+        export_menu.addSeparator()
+        for layout_name, text in PDF_LAYOUTS.items():
+            export_menu.addAction(
+                f"퀴즈 PDF: {text}", lambda name=layout_name: self.reader and self.reader.quiz_panel.export_pdf(name)
+            )
         export_menu.addSeparator()
         export_menu.addAction("프로젝트 폴더 열기", self.open_folder)
         export_button = QToolButton()
@@ -398,6 +404,7 @@ class MainWindow(QMainWindow):
                 "번역·사전·GPT 질문은 이 컴퓨터의 Codex CLI(ChatGPT 계정 로그인)를 통해 GPT를 사용합니다.\n\n"
                 "• 논문의 <텍스트>가 OpenAI로 전송됩니다.\n"
                 "• GPT 탭에서 질문할 때 직접 첨부한 캡처 이미지도 함께 전송됩니다.\n"
+                "• 퀴즈를 만들 때는 그 슬라이드의 텍스트, 등록한 STT 중 해당 부분, 이전 퀴즈 예시가 전송됩니다.\n"
                 "• PDF 파일 자체와 메모·노트는 전송되지 않습니다.\n"
                 "• API 키나 별도 요금은 필요 없고, ChatGPT 사용량이 차감됩니다.\n\n"
                 "사용하시겠습니까? (설정에서 언제든 끌 수 있습니다)",
