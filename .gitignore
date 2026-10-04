@@ -8,3 +8,5 @@ __pycache__/
 *.log
 /dist/
 /build/
+# Course materials (professors' quizzes) used as style references; not ours to publish
+/quiz_reference/
