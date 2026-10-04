@@ -115,3 +115,43 @@ def test_two_sentences_get_separate_rects() -> None:
     )
     assert set(laid.sentence_rects) == {"a", "b"}
     assert laid.sentence_rects["a"][0].x1 <= laid.sentence_rects["b"][0].x0
+
+
+def test_labels_inside_a_wide_figure_do_not_hide_the_gutter(tmp_path: Path) -> None:
+    """A full-width diagram above two columns ("RAG over Thinking Traces", p.2):
+    its labels cross the gutter, and must not make the page one column."""
+    import pymupdf
+
+    from tests.conftest import LOREM
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.draw_rect(pymupdf.Rect(60, 50, 552, 300), color=(0, 0, 0))
+    for row in range(14):
+        y = 70 + row * 16
+        page.draw_rect(pymupdf.Rect(250, y - 2, 360, y + 10), color=(0.2, 0.2, 0.8))
+        page.insert_text((262, y + 7), f"Step {row} label text", fontsize=7)
+    for index, x in enumerate((48, 318)):
+        page.insert_textbox(
+            pymupdf.Rect(x, 320, x + 246, 740), (LOREM * 4) + f" Column {index + 1} ends here.", fontsize=9.5
+        )
+    pdf = tmp_path / "figure.pdf"
+    doc.save(pdf)
+
+    with PaperDocument(pdf) as document:
+        layout = extract_paper(document.raw)
+    result = layout.pages[0]
+    assert len(result.columns) == 2
+    for block in result.blocks:
+        if block.kind == BlockKind.BODY:
+            assert not ("Column 1" in block.text and "Column 2" in block.text)
+
+
+def test_a_sentence_about_a_figure_is_not_its_caption() -> None:
+    from paper_saver.pdf.extract import _CAPTION_RE
+
+    assert _CAPTION_RE.match("Figure 1: Overview of the method")
+    assert _CAPTION_RE.match("Table 1 Results on three benchmarks")
+    assert _CAPTION_RE.match("FIG. 2. Accuracy")
+    assert not _CAPTION_RE.match("Figure 1 illustrates the overview of the process.")
+    assert not _CAPTION_RE.match("Table 2 shows that retrieval helps.")

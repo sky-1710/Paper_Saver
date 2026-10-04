@@ -34,6 +34,7 @@ __all__ = [
     "EngineAvailability",
     "EngineAuthError",
     "EngineNotFoundError",
+    "EnginePromptRejected",
     "EngineRateLimited",
     "TranslationCancelled",
     "TranslationEngine",
@@ -59,6 +60,16 @@ class EngineRateLimited(TranslationError):
     Worth its own class because it is the one failure that is neither the
     user's mistake nor a bug: the work done so far is kept and the rest can be
     picked up later, so the message says that rather than apologising.
+    """
+
+
+class EnginePromptRejected(TranslationError):
+    """OpenAI refused the prompt as possibly against its usage policy.
+
+    With papers this is nearly always a false positive set off by text the
+    paper quotes - an evaluation prompt, a grading rubric, a jailbreak
+    example - and not by the reader's question. Sending the same text again
+    fails the same way, so callers send less rather than retry.
     """
 
 
@@ -113,6 +124,24 @@ class TranslationEngine(ABC):
         if images and not self.supports_images:
             raise TranslationError("이 엔진은 이미지를 볼 수 없습니다. 캡처 없이 질문해 주세요.")
         return self.translate(prompt, cancel=cancel)
+
+    #: Whether :meth:`converse` can continue a session, so a follow-up need
+    #: not carry again what the session was sent (see ``core.chat_context``).
+    supports_sessions: bool = False
+
+    def converse(
+        self, prompt: str, *, session: str | None = None, images: Sequence[Path] = (), cancel: threading.Event
+    ) -> tuple[str, str | None]:
+        """One turn of a conversation: the answer, and the session it is in.
+
+        ``session`` continues an earlier one. An engine without sessions
+        answers on its own and returns ``None``; the caller then sends the
+        whole context every time, as it must.
+        """
+        return self.ask(prompt, images=images, cancel=cancel), None
+
+    def forget_session(self, session: str) -> None:  # noqa: B027 - most engines keep nothing
+        """Delete whatever a session left on this computer."""
 
     def generate_json(
         self,

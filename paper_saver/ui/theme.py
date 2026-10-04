@@ -17,11 +17,12 @@ QTabBar::tab { padding: 6px 16px; }
 QTabBar::tab:selected { font-weight: 600; }
 QPushButton { padding: 5px 12px; border: 1px solid #cfd4da; border-radius: 5px; background: #fff; }
 QPushButton:hover { background: #f0f3f7; }
+QPushButton:checked { background: #dbe7fb; border-color: #1a73e8; color: #1a4fb4; font-weight: 600; }
 QPushButton#primary { background: #1a73e8; color: white; border-color: #1a73e8; font-size: 12pt; padding: 10px 26px; }
 QPushButton#primary:hover { background: #1765cc; }
 QProgressBar { border: 1px solid #cfd4da; border-radius: 4px; text-align: center; height: 16px; background: #fff; }
 QProgressBar::chunk { background: #34a853; border-radius: 3px; }
-QListWidget, QTableWidget, QPlainTextEdit, QTextBrowser, QLineEdit { border: 1px solid #dfe2e6; border-radius: 4px; }
+QListWidget, QTableWidget, QPlainTextEdit, QTextBrowser, QTextEdit#liveMarkdown, QLineEdit { border: 1px solid #dfe2e6; border-radius: 4px; }
 QFrame#quizMaterials { background: #f8f9fb; border: 1px solid #e3e6ea; border-radius: 6px; }
 QLabel#materialKind { font-weight: 600; color: #1a4fb4; padding-top: 4px; }
 QLabel#quizSlide { font-size: 12pt; font-weight: 700; color: #202124; }
@@ -44,5 +45,13 @@ QPushButton#quizChoice { font-size: 13pt; font-weight: 700; min-width: 64px; pad
 QPushButton#quizPrimary { background: #1a73e8; color: white; border-color: #1a73e8; padding: 7px 18px; font-weight: 600; }
 QPushButton#quizPrimary:hover { background: #1765cc; }
 QPushButton#quizPrimary:disabled { background: #a8c7fa; border-color: #a8c7fa; }
+QFrame#bookmarkCard { background: #fff; border: 1px solid #e3e6ea; border-radius: 6px; }
+QFrame#bookmarkCard:hover { background: #f8f9fb; }
+QLabel#bookmarkPage { color: #80868b; font-size: 9pt; }
+QLabel#bookmarkText { font-family: 'Georgia', 'Times New Roman', serif; color: #202124; }
+QLabel#bookmarkTranslation { color: #1a3e8c; }
+QLabel#bookmarkNote { background: #fef7e0; border-radius: 4px; padding: 5px 7px; color: #5c4400; margin-top: 2px; }
+QTreeWidget { border: 1px solid #dfe2e6; border-radius: 4px; }
+QTreeWidget::item { padding: 4px 2px; }
 QPlainTextEdit { font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Menlo', 'Consolas', monospace; }
 """

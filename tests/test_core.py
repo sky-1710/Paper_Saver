@@ -60,13 +60,32 @@ def test_distance_and_line_merge() -> None:
 # -- prompts ------------------------------------------------------------------------------
 
 
-def test_prompt_carries_ids_and_formula_rule() -> None:
-    prompt = batch_prompt([SentenceRequest("p1b2s1", "The loss ⟦m1⟧ is minimised.")])
-    assert '"id": "p1b2s1"' in prompt
-    assert "⟦m1⟧" in prompt
+def test_prompt_numbers_sentences_and_keeps_formula_rule() -> None:
+    prompt = batch_prompt([
+        SentenceRequest("p1b2s1", "The loss ⟦m1⟧ is\nminimised."),
+        SentenceRequest("p1b2s2", "Related Work", "heading"),
+    ])
+    assert "[1] The loss ⟦m1⟧ is minimised." in prompt
+    assert "[2] (heading) Related Work" in prompt
+    assert "p1b2s1" not in prompt  # ids stay here; numbers go out
 
 
-def test_parse_batch_tolerates_fences_and_drops_unknown_ids() -> None:
+def test_parse_batch_reads_numbered_lines() -> None:
+    answer = (
+        "번역입니다:\n\n[1] 손실 ⟦m1⟧이 최소화된다.\n"
+        "**[2]** (heading) 관련 연구\n"
+        "[3] 이 방법은 기존 방법을 따르며,\n[4]에서 제안된 정규화를 쓴다.\n"  # wrapped, opens with a citation
+        "[2] 중복\n[9] 묻지 않은 번호\n"
+    )
+    assert parse_batch(answer, ["a", "b", "c"]) == {
+        "a": "손실 ⟦m1⟧이 최소화된다.",
+        "b": "관련 연구",
+        "c": "이 방법은 기존 방법을 따르며, [4]에서 제안된 정규화를 쓴다.",
+    }
+    assert parse_batch("[1] 하나\n```", ["a", "b"]) == {"a": "하나"}  # b is simply still missing
+
+
+def test_parse_batch_still_reads_the_old_json_shape() -> None:
     answer = 'Here you go:\n```json\n{"translations": [{"id": "a", "ko": "가 나"}, {"id": "zzz", "ko": "x"},]}\n```'
     assert parse_batch(answer, ["a", "b"]) == {"a": "가 나"}
 

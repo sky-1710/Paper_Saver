@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pymupdf
 
-__all__ = ["MATERIAL_SUFFIXES", "MaterialError", "read_pages"]
+__all__ = ["MATERIAL_SUFFIXES", "MaterialError", "read_pages", "read_paper"]
 
 #: Text formats a transcript or a quiz may come in, besides PDF.
 TEXT_SUFFIXES = (".txt", ".md", ".markdown", ".srt", ".vtt")
@@ -47,3 +47,21 @@ def read_pages(path: Path) -> list[str]:
             raise MaterialError(f"'{path.name}'을(를) 읽지 못했습니다:\n{exc}") from exc
     accepted = ", ".join(s.lstrip(".") for s in MATERIAL_SUFFIXES)
     raise MaterialError(f"'{path.name}'은(는) 지원하지 않는 형식입니다. ({accepted})")
+
+
+def read_paper(root: Path) -> tuple[str, str]:
+    """Another paper's title and text, each page headed ``[p.N]``.
+
+    The text is read from the project's layout when it is current, so it is
+    the same text the reader saw; otherwise from its PDF.
+    """
+    from ..core.project import Project
+
+    project = Project(root)
+    layout = project.load_layout()
+    if layout is not None:
+        pages = ["\n\n".join(" ".join(b.text.split()) for b in page.blocks if b.text.strip()) for page in layout.pages]
+    else:
+        pages = read_pages(project.pdf_path)
+    text = "\n\n".join(f"[p.{n}]\n{page.strip()}" for n, page in enumerate(pages, start=1) if page.strip())
+    return project.title, text

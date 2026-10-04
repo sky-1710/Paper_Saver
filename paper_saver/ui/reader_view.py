@@ -46,7 +46,9 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import Settings
+from ..core.atomic_io import read_json
 from ..core.chat import ChatLog, render_citations, resolve_citations
+from ..core.chat_context import ContextBuilder, PaperSource, SessionState
 from ..core.geometry import Rect
 from ..core.lecture import (
     SlideDeck,
@@ -56,16 +58,31 @@ from ..core.lecture import (
     parse_transcript,
     transcript_excerpt,
 )
+from ..core.notebook import IMAGE_SUFFIXES
 from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
-from ..core.project import HIGHLIGHT_COLORS, WordEntry
+from ..core.project import HIGHLIGHT_COLORS, Project, WordEntry
 from ..core.quiz import QuizStore, id_prefix
 from ..pdf.document import PaperDocument
-from ..pdf.text import MaterialError, read_pages
+from ..pdf.text import MaterialError, read_pages, read_paper
 from ..render.quiz_pdf import PLACEMENTS, quiz_pdf, slides_quiz_pdf
+from ..translate.codex_cli import forget_codex_session
 from ..translate.dictionary import Dictionary, clean_word
-from ..translate.engine import TranslationCancelled, TranslationEngine, TranslationError
-from ..translate.prompts import chat_prompt, sentence_tag
+from ..translate.engine import (
+    EnginePromptRejected,
+    EngineRateLimited,
+    TranslationCancelled,
+    TranslationEngine,
+    TranslationError,
+)
+from ..translate.prompts import (
+    CHAT_FILE_CHARS,
+    CHAT_PAPER_CHARS,
+    chat_followup_prompt,
+    chat_prompt,
+    sentence_tag,
+)
 from ..translate.quiz import CodexQuizGenerator, QuizGenerationInput
+from .bookmarks_panel import BookmarksPanel
 from .chat_panel import ChatPanel
 from .dictionary_panel import DictionaryPanel
 from .keys import CAPTURE_LABEL
@@ -83,6 +100,9 @@ __all__ = ["ReaderView"]
 
 NOTE_KEY = "Ctrl+Shift+M" if sys.platform == "darwin" else "Ctrl+M"
 HIGHLIGHT_KEY = "Ctrl+Shift+H" if sys.platform == "darwin" else "Ctrl+H"
+GPT_KEY = "Ctrl+Shift+G" if sys.platform == "darwin" else "Ctrl+G"
+#: What "GPT에게 이 문장 설명 요청" asks.
+EXPLAIN_QUESTION = "이 문장을 쉽게 풀어서 설명해 주세요. 핵심 용어와, 앞뒤 맥락에서 이 문장이 하는 역할도 알려 주세요."
 #: Captures sent again with a follow-up question, at most.
 FOLLOW_UP_IMAGES = 3
 #: How the keys read in messages: Cmd on a Mac.
@@ -118,10 +138,46 @@ def _pane(title: str, canvas: PageCanvas) -> tuple[QWidget, _Scroll]:
     return box, scroll
 
 
+class _SideTabs(QTabWidget):
+    """The side tabs, each page in a scroll area of its own.
+
+    A tab widget is as tall as its tallest page needs (the quiz, about 400
+    px), and that minimum is what stopped the note below from being dragged
+    taller. Wrapped, a page scrolls when the space is short instead. Pages
+    are still added, shown and compared as the panels themselves.
+    """
+
+    def addTab(self, widget: QWidget, label: str) -> int:  # type: ignore[override]  # noqa: N802
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        # Short of height a page scrolls; short of width it narrows instead.
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setWidget(widget)
+        return super().addTab(area, label)
+
+    def setCurrentWidget(self, widget: QWidget) -> None:  # noqa: N802
+        for index in range(self.count()):
+            area = super().widget(index)
+            if area is widget or (isinstance(area, QScrollArea) and area.widget() is widget):
+                self.setCurrentIndex(index)
+                return
+
+    def currentWidget(self) -> QWidget | None:  # noqa: N802
+        area = super().currentWidget()
+        return area.widget() if isinstance(area, QScrollArea) else area
+
+
+#: Between a paper's key and a sentence id, in a citation of another paper.
+REF_SEPARATOR = "|"
+
+
 class ReaderView(QWidget):
     statusMessage = Signal(str)
     pageChanged = Signal(int)
     captureModeChanged = Signal(bool)
+    #: How many sentences an answer's citations lit in this paper (0: none).
+    evidenceLit = Signal(int)
 
     def __init__(
         self,
@@ -143,6 +199,11 @@ class ReaderView(QWidget):
         self._page = 0
         self._chat_task: BackgroundTask | None = None
         self._closed = False
+        #: The other papers open in tabs, and how to bring one to the front;
+        #: set by the window. A question can be asked of all of them, and an
+        #: answer's citations light each paper in its own tab.
+        self.peers: Callable[[], list[ReaderView]] = lambda: []
+        self.show_peer: Callable[[ReaderView], None] = lambda _reader: None
         #: What each capture of this session shows, for the prompt.
         self._capture_notes: dict[str, str] = {}
 
@@ -155,9 +216,16 @@ class ReaderView(QWidget):
         order = {s.id: i for i, (_, _, s) in enumerate(session.layout.sentences())}
         self.dictionary_panel = DictionaryPanel()
         self.notes_panel = NotesPanel(project.notes, order)
+        self.bookmarks_panel = BookmarksPanel(
+            project.highlights, project.notes, order, session.translation, self._sentence_text
+        )
         self.wordbook_panel = WordbookPanel(project.wordbook, project.exports_dir)
         self.chat_log = ChatLog(project.root / "chat.json")
-        self.chat_panel = ChatPanel(self.chat_log, page_of=self._page_of)
+        self.chat_log.on_session_end = self._forget_session
+        self.chat_panel = ChatPanel(
+            self.chat_log, page_of=self._page_of, recent_papers=self._recent_papers, paper_of=self._paper_label
+        )
+        self._attach_task: BackgroundTask | None = None
         self.note_panel = NotePanel(project, settings)
         self.quiz_store = QuizStore(project.root)
         self.quiz_panel = QuizPanel(
@@ -170,12 +238,12 @@ class ReaderView(QWidget):
         self._quiz_task: BackgroundTask | None = None
         self._material_task: BackgroundTask | None = None
         self._quiz_pdf_task: BackgroundTask | None = None
-        self.side = QTabWidget()
+        self.side = _SideTabs()
         self.side.addTab(self.dictionary_panel, "사전")
         self.side.addTab(self.chat_panel, "GPT")
         self.side.addTab(self.quiz_panel, "퀴즈")
-        self.side.addTab(self.note_panel, "노트")
         self.side.addTab(self.notes_panel, "메모")
+        self.side.addTab(self.bookmarks_panel, "북마크")
         self.side.addTab(self.wordbook_panel, "단어장")
         self.side.setMinimumWidth(260)
 
@@ -187,6 +255,16 @@ class ReaderView(QWidget):
         self.splitter.setStretchFactor(1, 5)
         self.splitter.setStretchFactor(2, 3)
         self.splitter.setChildrenCollapsible(True)
+
+        # The Markdown note sits under both panes, full width, so it can be
+        # written while the page and the side tabs stay in view.
+        self.vsplitter = QSplitter(Qt.Orientation.Vertical)
+        self.vsplitter.addWidget(self.splitter)
+        self.vsplitter.addWidget(self.note_panel)
+        self.vsplitter.setStretchFactor(0, 7)
+        self.vsplitter.setStretchFactor(1, 3)
+        self.vsplitter.setCollapsible(0, False)
+        self.vsplitter.setChildrenCollapsible(True)
 
         self.pair_source = QLabel()
         self.pair_target = QLabel()
@@ -208,7 +286,7 @@ class ReaderView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(self.splitter, 1)
+        layout.addWidget(self.vsplitter, 1)
         layout.addWidget(pair)
 
         self._wire()
@@ -246,6 +324,11 @@ class ReaderView(QWidget):
         example.toggled.connect(lambda on: self.settings.set("obsidian_example", on))
         self.notes_panel.jumpRequested.connect(self.jump_to_sentence)
         self.notes_panel.notesChanged.connect(self._apply_notes)
+        self.bookmarks_panel.jumpRequested.connect(self._jump_to_bookmark)
+        self.bookmarks_panel.notesChanged.connect(self.notes_panel.refresh)
+        self.bookmarks_panel.notesChanged.connect(self._apply_notes)
+        self.bookmarks_panel.recolorRequested.connect(self._recolor_bookmark)
+        self.bookmarks_panel.removeRequested.connect(self._remove_bookmark)
         self.wordbook_panel.jumpRequested.connect(self.jump_to_sentence)
 
         for canvas in (self.left, self.right):
@@ -260,7 +343,9 @@ class ReaderView(QWidget):
             lambda image: self.chat_panel.attach(self._save_capture(image, None, "붙여 넣은 이미지"))
         )
         self.chat_panel.toNoteRequested.connect(self.answer_to_note)
-        self.chat_panel.evidenceRequested.connect(self.show_evidence)
+        self.chat_panel.filesChosen.connect(self.attach_files)
+        self.chat_panel.paperChosen.connect(lambda root: self.attach_paper(Path(root)))
+        self.chat_panel.evidenceRequested.connect(lambda ids: self.show_evidence(ids, follow=True))
         self.note_panel.statusMessage.connect(self.statusMessage)
 
         self.quiz_panel.generateRequested.connect(self.generate_quiz)
@@ -270,12 +355,17 @@ class ReaderView(QWidget):
         self.quiz_panel.stylesChosen.connect(self._register_styles)
         self.quiz_panel.pdfExportRequested.connect(self.export_quiz_pdf)
         self.side.currentChanged.connect(lambda _i: self.side.currentWidget() is self.quiz_panel and self._load_deck())
+        # Translations arrive after a sentence is marked; shown, the list is current.
+        self.side.currentChanged.connect(
+            lambda _i: self.side.currentWidget() is self.bookmarks_panel and self.bookmarks_panel.refresh()
+        )
 
         # Qt maps Ctrl to Cmd on a Mac, where Cmd+M minimises and Cmd+H hides
         # the application before the window ever sees the key - so the Mac
         # gets Shift added. See NOTE_KEY / HIGHLIGHT_KEY.
         QShortcut(QKeySequence(NOTE_KEY), self, activated=self._note_on_hover)
         QShortcut(QKeySequence(HIGHLIGHT_KEY), self, activated=self._highlight_on_hover)
+        QShortcut(QKeySequence(GPT_KEY), self, activated=self._gpt_on_hover)
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.cancel_capture)
         QShortcut(QKeySequence("Ctrl+="), self, activated=lambda: self.zoom_step(1))
         QShortcut(QKeySequence("Ctrl++"), self, activated=lambda: self.zoom_step(1))
@@ -315,7 +405,7 @@ class ReaderView(QWidget):
         ratio = bar.value() / max(1, bar.maximum())
         self.left.set_zoom(zoom)
         self.right.set_zoom(zoom)
-        QTimer.singleShot(0, lambda: bar.setValue(int(ratio * bar.maximum())))
+        QTimer.singleShot(0, bar, lambda: bar.setValue(int(ratio * bar.maximum())))
         self.settings.set("zoom", round(self.left.zoom, 3))
         self.statusMessage.emit(f"확대 {self.left.zoom * 100:.0f}%")
 
@@ -345,6 +435,12 @@ class ReaderView(QWidget):
         self.left_scroll.verticalScrollBar().setValue(max(0, y))
         return True
 
+    def _jump_to_bookmark(self, sentence_id: str, page: int) -> None:
+        if sentence_id and self.session.sentence(sentence_id) is not None:
+            self.jump_to_sentence(sentence_id)
+        else:
+            self.goto_page(page)
+
     def jump_to_sentence(self, sentence_id: str) -> None:
         if not self._scroll_to_sentence(sentence_id):
             return
@@ -352,19 +448,61 @@ class ReaderView(QWidget):
             canvas.set_focus_sentence(sentence_id)
         QTimer.singleShot(2500, lambda: [c.set_focus_sentence("") for c in (self.left, self.right)])
 
-    def show_evidence(self, sentence_ids: list[str], *, scroll: bool = True) -> None:
+    def show_evidence(self, sentence_ids: list[str], *, scroll: bool = True, follow: bool = False) -> None:
         """Light the sentences a GPT answer cited, on both pages, and bring
-        the first into view; an empty list puts the lights out."""
-        ids = [i for i in sentence_ids if self.session.sentence(i) is not None]
-        for canvas in (self.left, self.right):
-            canvas.set_evidence(ids)
-        if ids and scroll:
-            self._scroll_to_sentence(ids[0])
-            self._set_pair(ids[0])
+        the first into view; an empty list puts the lights out.
 
-    def _page_of(self, sentence_id: str) -> int | None:
-        ref = self.session.sentence(sentence_id)
-        return ref.page if ref is not None else None
+        Citations of other open papers light those papers, each in its own
+        tab. With ``follow`` (a citation link was clicked) and nothing here
+        to show, the tab of the paper cited is brought to the front.
+        """
+        own: list[str] = []
+        elsewhere: dict[ReaderView, list[str]] = {}
+        for ref in sentence_ids:
+            reader, sentence_id = self._resolve_ref(ref)
+            if reader is self:
+                own.append(sentence_id)
+            elif reader is not None:
+                elsewhere.setdefault(reader, []).append(sentence_id)
+        ids = [i for i in own if self.session.sentence(i) is not None]
+        if ids or not elsewhere:
+            for canvas in (self.left, self.right):
+                canvas.set_evidence(ids)
+            if ids and scroll:
+                self._scroll_to_sentence(ids[0])
+                self._set_pair(ids[0])
+            self.evidenceLit.emit(len(ids))
+        for reader, group in elsewhere.items():
+            reader.show_evidence(group, scroll=scroll)
+        if follow and not ids and elsewhere:
+            self.show_peer(next(iter(elsewhere)))
+
+    @property
+    def paper_key(self) -> str:
+        """Names this paper in a citation made from another one."""
+        return str(self.session.project.root.resolve())
+
+    def _resolve_ref(self, ref: str) -> tuple[ReaderView | None, str]:
+        """The open paper a cited sentence is in, and its id there."""
+        if REF_SEPARATOR not in ref:
+            return self, ref
+        key, sentence_id = ref.rsplit(REF_SEPARATOR, 1)
+        if key == self.paper_key:
+            return self, sentence_id
+        return next((r for r in self.peers() if r.paper_key == key), None), sentence_id
+
+    def _page_of(self, ref: str) -> int | None:
+        reader, sentence_id = self._resolve_ref(ref)
+        found = reader.session.sentence(sentence_id) if reader is not None else None
+        return found.page if found is not None else None
+
+    def _paper_label(self, ref: str) -> str:
+        """A cited paper's short title; "" for this one."""
+        reader, _ = self._resolve_ref(ref)
+        if reader is None or reader is self:
+            return ""
+        title = reader.session.project.title
+        return title if len(title) <= 24 else title[:23] + "…"
 
     # -- hover pair (§2.3) -----------------------------------------------------------
 
@@ -530,6 +668,19 @@ class ReaderView(QWidget):
         else:
             self.splitter.setSizes([total // 2, total - total // 2, 0])
 
+    def _reveal_note(self) -> None:
+        sizes = self.vsplitter.sizes()
+        if sizes[1] < 40:
+            total = sum(sizes)
+            self.vsplitter.setSizes([int(total * 0.7), total - int(total * 0.7)])
+
+    def toggle_note(self) -> None:
+        sizes = self.vsplitter.sizes()
+        if sizes[1] < 40:
+            self._reveal_note()
+        else:
+            self.vsplitter.setSizes([sum(sizes), 0])
+
     # -- sentence menu and notes (§4) -------------------------------------------------
 
     def _on_menu(self, sentence_id: str, pos: QPoint) -> None:
@@ -539,6 +690,8 @@ class ReaderView(QWidget):
         translation = self.session.translation(sentence_id) or ""
         menu = QMenu(self)
         menu.addAction("메모 추가…", lambda: self.add_note(sentence_id))
+        menu.addAction(f"GPT 입력창에 넣기\t{_MOD}G", lambda: self.quote_to_gpt(sentence_id))
+        menu.addAction("GPT에게 이 문장 설명 요청", lambda: self.quote_to_gpt(sentence_id, ask=True))
         pens = menu.addMenu("형광펜")
         current = self.session.project.highlights.color_of(sentence_id)
         for name, color in HIGHLIGHT_COLORS.items():
@@ -590,6 +743,39 @@ class ReaderView(QWidget):
                 for s in marks.strokes
                 if s.side == side
             ])
+        self.bookmarks_panel.refresh()
+
+    def _recolor_bookmark(self, kind: str, key: str, color: str) -> None:
+        if kind == "stroke":
+            self._recolor(key, color)
+        else:
+            self.highlight(key, color)
+
+    def _remove_bookmark(self, kind: str, key: str) -> None:
+        if kind == "stroke":
+            self._remove_stroke(key)
+        else:
+            self.highlight(key, None)
+
+    def _sentence_text(self, sentence_id: str) -> str:
+        ref = self.session.sentence(sentence_id)
+        return _plain(ref.sentence.text) if ref is not None else ""
+
+    def _sentence_under(self, side: str, page: int, rects: list) -> str:
+        """The sentence a stroke starts in, on the side it was drawn on."""
+        try:
+            placed = self.session.source_rects(page) if side == "source" else self.session.translated_rects(page)
+        except (IndexError, KeyError):
+            return ""
+        for rect in sorted(rects, key=lambda r: (r.y0, r.x0)):
+            best = max(
+                ((sid, overlap.area) for sid, other in placed if (overlap := rect.intersection(other)) is not None),
+                key=lambda pair: pair[1],
+                default=None,
+            )
+            if best is not None:
+                return best[0]
+        return ""
 
     # -- free highlighter -------------------------------------------------------------------
 
@@ -603,7 +789,8 @@ class ReaderView(QWidget):
         if not pen or not rects:
             return
         self.session.project.highlights.add_stroke(
-            side, page, [r.as_list() for r in rects], _plain(text), pen
+            side, page, [r.as_list() for r in rects], _plain(text), pen,
+            sentence_id=self._sentence_under(side, page, rects),
         )
         self._apply_highlights()
 
@@ -630,6 +817,36 @@ class ReaderView(QWidget):
         self.session.project.highlights.remove_stroke(stroke_id)
         self._apply_highlights()
 
+    def _gpt_on_hover(self) -> None:
+        if self._hover:
+            self.quote_to_gpt(self._hover)
+        else:
+            self.statusMessage.emit(f"GPT에게 보낼 문장 위에 마우스를 올리고 {_MOD}G를 누르세요.")
+
+    def quote_to_gpt(self, sentence_id: str, *, ask: bool = False) -> None:
+        """Quote a sentence, and its translation, into the GPT tab's question.
+
+        With ``ask`` the question is sent at once, asking for an explanation;
+        otherwise the reader writes their own question under the quote.
+        """
+        ref = self.session.sentence(sentence_id)
+        if ref is None:
+            return
+        lines = [f"> p.{ref.page + 1} · {' '.join(_plain(ref.sentence.text).split())}"]
+        translation = " ".join(_plain(self.session.translation(sentence_id) or "").split())
+        if translation:
+            lines.append(f"> (번역) {translation}")
+        self.chat_panel.add_quote("\n".join(lines))
+        self._show_tab(self.chat_panel)
+        if not ask:
+            return
+        if self.chat_panel.busy:
+            self.chat_panel.show_status("앞 질문의 답을 기다리는 중입니다. 끝나면 보내기를 누르세요.")
+            return
+        current = self.chat_panel.input.toPlainText().rstrip()
+        self.chat_panel.input.setPlainText(f"{current}\n\n{EXPLAIN_QUESTION}")
+        self.chat_panel.send()
+
     def _note_on_hover(self) -> None:
         if self._hover:
             self.add_note(self._hover)
@@ -651,6 +868,7 @@ class ReaderView(QWidget):
         ]
         self.left.set_margin_notes(notes)
         self.right.set_margin_notes(notes)
+        self.bookmarks_panel.refresh()
 
     def _edit_note(self, note_id: str) -> None:
         self.side.setCurrentWidget(self.notes_panel)
@@ -731,15 +949,31 @@ class ReaderView(QWidget):
         return relative
 
     def _show_tab(self, widget: QWidget) -> None:
+        if widget is self.note_panel:
+            self._reveal_note()
+            return
         self.side.setCurrentWidget(widget)
         self._reveal_side()
 
     # -- GPT --------------------------------------------------------------------------
 
-    def _page_text(self, number: int) -> tuple[str, dict[int, str]]:
+    def _paper_text(self, numbering: dict[int, str] | None = None, prefix: str = "") -> tuple[str, dict[int, str]]:
+        """Every page, each headed [p.N], tagged as one numbering."""
+        numbering = {} if numbering is None else numbering
+        pages = []
+        for number in range(self.session.page_count):
+            text, _ = self._page_text(number, numbering, prefix)
+            if text.strip():
+                pages.append(f"[p.{number + 1}]\n{text}")
+        return "\n\n".join(pages), numbering
+
+    def _page_text(
+        self, number: int, numbering: dict[int, str] | None = None, prefix: str = ""
+    ) -> tuple[str, dict[int, str]]:
         """The page's text for GPT with every linkable sentence tagged, and
-        the sentence id each tag number stands for."""
-        numbering: dict[int, str] = {}
+        the sentence id each tag number stands for (continuing ``numbering``
+        when one is given; ``prefix`` goes before each id)."""
+        numbering = {} if numbering is None else numbering
         paragraphs: list[str] = []
         for block in self.session.layout.pages[number].blocks:
             if not block.text.strip():
@@ -749,12 +983,57 @@ class ReaderView(QWidget):
                 continue
             parts: list[str] = []
             for sentence in block.sentences:
-                numbering[len(numbering) + 1] = sentence.id
+                numbering[len(numbering) + 1] = prefix + sentence.id
                 parts.append(f"{sentence_tag(len(numbering))} {_plain(sentence.text)}")
             paragraphs.append(" ".join(parts))
         return "\n\n".join(paragraphs), numbering
 
+    def _sources(self) -> tuple[PaperSource, list[PaperSource]]:
+        """This paper and the others open in tabs, for the context builder."""
+        own = PaperSource("", self.session.project.title, self.session.layout, self.session.translation)
+        others = [
+            PaperSource(r.paper_key, r.session.project.title, r.session.layout, r.session.translation)
+            for r in self.peers()
+        ]
+        return own, others
+
+    def _context(self, state: SessionState, scope: str, page: int, query: str) -> list[str]:
+        """What has not yet gone to this session, for a question in ``scope``."""
+        builder = ContextBuilder(state)
+        own, others = self._sources()
+        parts: list[str | None] = []
+        if scope == "paper":
+            parts.append(builder.paper(own, limit=CHAT_PAPER_CHARS))
+        elif scope == "tabs" and others:
+            papers = [own, *others]
+            labels = [
+                f"[논문 {i}] {p.title}{' (독자가 보고 있는 논문)' if i == 1 else ''} — " for i, p in enumerate(papers, 1)
+            ]
+            parts.append(builder.page(own, page, labels[0]))
+            parts += builder.related(papers, query, labels)
+        elif scope == "related":
+            # "이 논문" cut down after OpenAI refused the whole of it.
+            parts.append(builder.page(own, page))
+            parts += builder.related([own], query, [""])
+        else:
+            parts.append(builder.page(own, page))
+        for index, item in enumerate(self.chat_log.files, start=1):
+            header = f"[자료 {index}] {item.name}" + (" (다른 논문)" if item.kind == "paper" else "")
+            parts.append(builder.document(item.id, header, self.chat_log.file_text(item), CHAT_FILE_CHARS))
+        return [p for p in parts if p]
+
+    def _forget_session(self, state: SessionState) -> None:
+        """A session ended (새 대화, a file taken off): delete its file."""
+        if state.id and state.engine == "codex":
+            forget_codex_session(state.id)
+
     def ask_gpt(self, question: str, images: list[str]) -> None:
+        """Send a question; in a session, only what it has not been sent.
+
+        Two prompts are made: the follow-up for the session the conversation
+        is in, and a fresh one carrying everything (the first question, an
+        engine without sessions, or a session that could not be resumed).
+        """
         if self._chat_task is not None and self._chat_task.running:
             return
         engine = self._engine_provider()
@@ -762,47 +1041,222 @@ class ReaderView(QWidget):
             self.chat_panel.failed("GPT 사용에 동의하고 Codex가 설치되어 있어야 질문할 수 있습니다.", question, images)
             return
         pages = [int(m.group(1)) - 1 for i in images if (m := re.search(r"capture-p(\d+)-", i))]
+        # A quoted sentence (quote_to_gpt) says which page the question is about.
+        pages += [int(n) - 1 for n in re.findall(r"^> p\.(\d+) · ", question, re.MULTILINE)]
+        pages = [p for p in pages if 0 <= p < self.session.page_count]
         page = pages[0] if pages else self._page
-        history = self.chat_log.history()
-        # A follow-up without a picture is usually about the last one asked about.
+        scope = self.chat_panel.scope
+        # A follow-up ("그건 왜?") is matched together with the question before.
+        previous = next((m.text for m in reversed(self.chat_log.messages) if m.role == "user"), "")
+        query = f"{question}\n{previous}"
+
+        key = str(getattr(engine, "key", ""))
+        state = self.chat_log.session if getattr(engine, "supports_sessions", False) else None
+        if state is not None and state.engine != key:
+            self.chat_log.end_session()
+            state = None
+        follow_up: tuple[str, SessionState, list[Path]] | None = None
+        if state is not None:
+            # The session saw every earlier capture; only new ones go.
+            continued = state.copy()
+            parts = self._context(continued, scope, page, query)
+            notes = [self._capture_notes.get(i, "논문 화면에서 잘라낸 캡처") for i in images]
+            prompt = chat_followup_prompt(question, context=parts, image_notes=notes)
+            follow_up = (prompt, continued, [self.chat_log.absolute(i) for i in images])
+
+        # A fresh start re-sends the latest captures: every new run starts blind.
         earlier = [] if images else self.chat_log.recent_images(FOLLOW_UP_IMAGES)
         attached = [i for i in [*earlier, *images] if self.chat_log.absolute(i).is_file()]
         notes = [
-            ("이전 질문에 첨부했던 " if i in earlier else "")
-            + self._capture_notes.get(i, "논문 화면에서 잘라낸 캡처")
+            ("이전 질문에 첨부했던 " if i in earlier else "") + self._capture_notes.get(i, "논문 화면에서 잘라낸 캡처")
             for i in attached
         ]
-        page_text, numbering = self._page_text(page)
-        prompt = chat_prompt(
-            question, title=self.session.project.title, page_label=f"p.{page + 1}",
-            page_text=page_text, history=history, image_notes=notes, cite=bool(numbering),
+        fresh = SessionState(engine=key)
+        parts = self._context(fresh, scope, page, query)
+        fresh_prompt = chat_prompt(
+            question, title=self.session.project.title, history=self.chat_log.history(), image_notes=notes,
+            cite=bool(fresh.numbering), context=parts,
         )
-        message = self.chat_log.add("user", question, images=images, page=page)
+        fresh_paths = [self.chat_log.absolute(i) for i in attached]
+        # If OpenAI refuses the whole paper (a quoted grading prompt in an
+        # appendix will do it), the same question once more with only the
+        # page in view and the passages that match it.
+        narrow: tuple[str, SessionState] | None = None
+        if scope == "paper":
+            cut = SessionState(engine=key)
+            narrow_parts = self._context(cut, "related", page, query)
+            narrow = (
+                chat_prompt(
+                    question, title=self.session.project.title, history=self.chat_log.history(), image_notes=notes,
+                    cite=bool(cut.numbering), context=narrow_parts,
+                ),
+                cut,
+            )
+
+        message = self.chat_log.add(
+            "user", question, images=images, page=page, files=[f.name for f in self.chat_log.files]
+        )
         self.chat_panel.accepted()
-        paths = [self.chat_log.absolute(i) for i in attached]
+        if follow_up is not None:
+            new_chars = len(follow_up[0]) - len(question)
+            self.chat_panel.show_status(
+                f"이어서 묻는 중… 앞에서 보낸 본문은 다시 보내지 않습니다 (새로 보내는 글 {new_chars:,}자)"
+            )
+        old = state.id if state is not None else None
 
         def work(cancel, _report):  # type: ignore[no-untyped-def]
-            return engine.ask(prompt, images=paths, cancel=cancel)
+            whole_refused = False
+            if follow_up is not None:
+                prompt, continued, paths = follow_up
+                try:
+                    answer, session = _converse(engine, prompt, old, paths, cancel)
+                    return answer, session, continued, None, ""
+                except (TranslationCancelled, EngineRateLimited):
+                    raise
+                except EnginePromptRejected:
+                    # Sending it all again would be refused again.
+                    if narrow is None:
+                        raise
+                    whole_refused = True
+                except TranslationError:
+                    pass  # the session is gone or broken: start afresh below
+            if not whole_refused:
+                try:
+                    answer, session = _converse(engine, fresh_prompt, None, fresh_paths, cancel)
+                    return answer, session, fresh, old, ""
+                except EnginePromptRejected:
+                    if narrow is None:
+                        raise
+            prompt, cut = narrow
+            answer, session = _converse(engine, prompt, None, fresh_paths, cancel)
+            note = (
+                "OpenAI가 논문 전체 본문을 거절해서(부록에 실린 평가용 프롬프트 같은 인용문 때문일 때가 많습니다) "
+                "보고 있는 쪽과 질문과 관련된 부분만 보내 답을 받았습니다."
+            )
+            return answer, session, cut, old, note
 
         # The paper may be closed before the answer comes back: the log still
         # takes it, but the panel is gone and must not be touched.
-        def answered(answer: str) -> None:
-            text, refs = resolve_citations(answer.strip(), numbering)
+        def answered(result) -> None:  # type: ignore[no-untyped-def]
+            answer, session, used, dropped, note = result
+            if session:
+                used.id = session
+                self.chat_log.set_session(used)
+            elif dropped:
+                self.chat_log.end_session()
+            if dropped and dropped != session and hasattr(engine, "forget_session"):
+                engine.forget_session(dropped)
+            text, refs = resolve_citations(answer.strip(), used.numbering)
             self.chat_log.add("assistant", text, refs=refs)
             if not self._closed:
                 self.chat_panel.set_busy(False)
+                if note:
+                    self.chat_panel.show_status(note)
                 self.show_evidence(refs)
 
         def failed(exc: Exception) -> None:
             self.chat_log.remove(message.id)
+            if isinstance(exc, EnginePromptRejected) and old:
+                # The session now holds the refused message, and would carry
+                # it into every later question: the next one starts afresh.
+                self.chat_log.end_session()
             if not self._closed:
                 text = "질문을 멈췄습니다." if isinstance(exc, TranslationCancelled) else str(exc)
+                if isinstance(exc, EnginePromptRejected):
+                    text += "\n\n범위를 '보는 쪽'이나 '모든 탭'으로 줄이거나, 문제가 될 만한 쪽을 피해서 다시 물어보세요."
                 self.chat_panel.failed(text, question, images)
 
         task = BackgroundTask(work, name="chat")
         task.succeeded.connect(answered)
         task.failed.connect(failed)
         self._chat_task = task.start()
+
+    # -- files attached to the conversation -------------------------------------------
+
+    def _recent_papers(self) -> list[tuple[str, str]]:
+        """Other papers opened before, as (title, folder), for 📎."""
+        here = self.session.project.root.resolve()
+        papers = []
+        for root in self.settings.recent_projects():
+            if root.resolve() == here:
+                continue
+            try:
+                title = str(read_json(root / Project.META).get("title") or root.name)
+            except (OSError, ValueError, AttributeError):
+                continue
+            papers.append((title, str(root)))
+        return papers
+
+    def attach_files(self, paths: list) -> None:
+        """Pictures join the question's captures; documents are read in a
+        worker, copied into the project and stay attached."""
+        documents = []
+        for path in map(Path, paths):
+            if path.suffix.lower() in IMAGE_SUFFIXES:
+                image = QImage(str(path))
+                if not image.isNull():
+                    self.chat_panel.attach(self._save_capture(image, None, f"첨부한 이미지 {path.name}"))
+            elif self.chat_log.has_source(path):
+                self.chat_panel.show_status(f"'{path.name}'은(는) 이미 첨부되어 있습니다.")
+            else:
+                documents.append(path)
+        if not documents:
+            return
+        log = self.chat_log
+
+        def work(_cancel, _report):  # type: ignore[no-untyped-def]
+            added = []
+            for source in documents:
+                pages = read_pages(source)
+                if len(pages) > 1:
+                    text = "\n\n".join(f"[p.{n}]\n{t.strip()}" for n, t in enumerate(pages, start=1) if t.strip())
+                else:
+                    text = "".join(pages).strip()
+                if not text:
+                    raise MaterialError(f"'{source.name}'에서 글자를 찾지 못했습니다. (스캔한 PDF라면 캡처로 보내 주세요)")
+                added.append(log.import_file(source, text))
+            return added
+
+        self._run_attach(work, f"{len(documents)}개 파일을 읽는 중…")
+
+    def attach_paper(self, root: Path) -> None:
+        if self.chat_log.has_source(root):
+            self.chat_panel.show_status("그 논문은 이미 첨부되어 있습니다.")
+            return
+        log = self.chat_log
+
+        def work(_cancel, _report):  # type: ignore[no-untyped-def]
+            title, text = read_paper(root)
+            if not text.strip():
+                raise MaterialError(f"'{title}'에서 글자를 찾지 못했습니다.")
+            return [log.import_paper(title, text, root)]
+
+        self._run_attach(work, "다른 논문의 본문을 읽는 중…")
+
+    def _run_attach(self, work, message: str) -> None:  # type: ignore[no-untyped-def]
+        if self._attach_task is not None and self._attach_task.running:
+            self.chat_panel.show_status("앞의 첨부를 읽는 중입니다. 잠시 뒤에 다시 해 주세요.")
+            return
+
+        # The files are recorded even if the paper closed meanwhile.
+        def finished(added) -> None:  # type: ignore[no-untyped-def]
+            for item in added:
+                self.chat_log.attach_file(item)
+            if not self._closed:
+                self.chat_panel.refresh_files()
+                names = ", ".join(item.name for item in added)
+                self.chat_panel.show_status(f"첨부했습니다: {names} — 떼기 전까지 모든 질문에 함께 갑니다.")
+
+        def failed(exc: Exception) -> None:
+            if not self._closed:
+                text = str(exc) if isinstance(exc, MaterialError) else f"첨부하지 못했습니다: {exc}"
+                self.chat_panel.show_status(text.split("\n")[0])
+
+        task = BackgroundTask(work, name="chat-attach")
+        task.succeeded.connect(finished)
+        task.failed.connect(failed)
+        self.chat_panel.show_status(message)
+        self._attach_task = task.start()
 
     def stop_gpt(self) -> None:
         if self._chat_task is not None and self._chat_task.running:
@@ -826,9 +1280,14 @@ class ReaderView(QWidget):
         self.statusMessage.emit("GPT 답변을 노트에 넣었습니다.")
 
     def _cite_pages(self, ids: list[str]) -> str:
-        """Citations as plain text for the note: " (p.3, p.4)"."""
-        pages = dict.fromkeys(p + 1 for i in ids if (p := self._page_of(i)) is not None)
-        return f" ({', '.join(f'p.{p}' for p in pages)})" if pages else ""
+        """Citations as plain text for the note: " (p.3, p.4)", or
+        " (Other Paper p.2)" for another paper's sentence."""
+        pages = dict.fromkeys(
+            f"{label + ' ' if (label := self._paper_label(i)) else ''}p.{p + 1}"
+            for i in ids
+            if (p := self._page_of(i)) is not None
+        )
+        return f" ({', '.join(pages)})" if pages else ""
 
     # -- quiz (§4c) ------------------------------------------------------------------
 
@@ -1048,3 +1507,10 @@ def _swatch(color: str) -> QIcon:
 def _plain(text: str) -> str:
     """Formula placeholders shown as a neutral mark in text-only places."""
     return re.sub("⟦m\\d+⟧", "[수식]", text or "")
+
+
+def _converse(engine, prompt: str, session: str | None, images: list[Path], cancel):  # type: ignore[no-untyped-def]
+    """One turn through ``engine``; an engine with only ``ask`` has no sessions."""
+    if hasattr(engine, "converse"):
+        return engine.converse(prompt, session=session, images=images, cancel=cancel)
+    return engine.ask(prompt, images=images, cancel=cancel), None

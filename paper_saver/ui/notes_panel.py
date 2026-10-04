@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QVBoxLayout,
@@ -28,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.project import AnchoredNote, Notes
+from .live_markdown import LiveMarkdownEdit
 
 __all__ = ["NotesPanel", "edit_note_text"]
 
@@ -51,14 +51,14 @@ class NotesPanel(QWidget):
         #: sentence id -> position in reading order, for sorting the list.
         self._order = order
 
-        self.memo = QPlainTextEdit()
+        self.memo = LiveMarkdownEdit()
         self.memo.setPlaceholderText(
-            "자유 메모 (Markdown). 요약, 질문, 아이디어를 적어두세요.\n자동 저장됩니다."
+            "자유 메모. # 제목, **굵게**, - 목록처럼 Markdown으로 적으면 바로 서식이 됩니다.\n자동 저장됩니다."
         )
         self.memo.setPlainText(notes.memo)
         self._timer = QTimer(self, singleShot=True, interval=700)
         self._timer.timeout.connect(self.save_memo)
-        self.memo.textChanged.connect(self._timer.start)
+        self.memo.edited.connect(self._timer.start)
         self.saved = QLabel()
         self.saved.setObjectName("muted")
 

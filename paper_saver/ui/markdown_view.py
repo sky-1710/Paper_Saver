@@ -13,9 +13,10 @@ from PySide6.QtWidgets import QPlainTextEdit
 
 from ..core.atomic_io import write_bytes_atomic
 from ..core.notebook import IMAGE_SUFFIXES, image_refs, resolve_image
+from ..pdf.text import MATERIAL_SUFFIXES
 from ..render.markdown_display import center_display_maths, prepare_markdown
 
-__all__ = ["ImagePasteEdit", "markdown_html", "png_bytes", "save_png"]
+__all__ = ["ImagePasteEdit", "dropped_documents", "markdown_html", "pasted_images", "png_bytes", "save_png"]
 
 
 def png_bytes(image: QImage) -> bytes:
@@ -74,6 +75,35 @@ def markdown_html(text: str, base_dir: Path | None, max_image_width: int) -> str
     return re.sub(r'<img src="([^"]+)"[^>]*/?>', sized, body)
 
 
+def pasted_images(source: QMimeData) -> list[QImage]:
+    """The pictures a paste or drop carries: image files, or a bare screenshot."""
+    images: list[QImage] = []
+    for url in source.urls() if source.hasUrls() else []:
+        path = Path(url.toLocalFile())
+        if path.suffix.lower() in IMAGE_SUFFIXES and path.is_file():
+            image = QImage(str(path))
+            if not image.isNull():
+                images.append(image)
+    # Word, OneNote and browsers put a picture of copied text on the
+    # clipboard alongside the text itself; text wins, so only a bare
+    # picture (a screenshot) pastes as an image.
+    if not images and source.hasImage() and not source.text().strip():
+        image = QImage(source.imageData())
+        if not image.isNull():
+            images.append(image)
+    return images
+
+
+def dropped_documents(source: QMimeData) -> list[Path]:
+    """Files a drop carries that can be read as text (PDF, txt, md, srt, vtt)."""
+    found = []
+    for url in source.urls() if source.hasUrls() else []:
+        path = Path(url.toLocalFile())
+        if path.suffix.lower() in MATERIAL_SUFFIXES and path.is_file():
+            found.append(path)
+    return found
+
+
 class ImagePasteEdit(QPlainTextEdit):
     """Plain text editing, plus: a pasted or dropped picture becomes a signal.
 
@@ -83,6 +113,8 @@ class ImagePasteEdit(QPlainTextEdit):
     """
 
     imagePasted = Signal(QImage)
+    #: Documents dropped in, when ``accept_documents`` is set: list of Paths.
+    documentsDropped = Signal(list)
     #: Enter without Shift, when ``submit_on_enter`` is set.
     submitted = Signal()
     focusedIn = Signal()
@@ -90,34 +122,22 @@ class ImagePasteEdit(QPlainTextEdit):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
         self.submit_on_enter = False
-
-    def _images(self, source: QMimeData) -> list[QImage]:
-        images: list[QImage] = []
-        for url in source.urls() if source.hasUrls() else []:
-            path = Path(url.toLocalFile())
-            if path.suffix.lower() in IMAGE_SUFFIXES and path.is_file():
-                image = QImage(str(path))
-                if not image.isNull():
-                    images.append(image)
-        # Word, OneNote and browsers put a picture of copied text on the
-        # clipboard alongside the text itself; text wins, so only a bare
-        # picture (a screenshot) pastes as an image.
-        if not images and source.hasImage() and not source.text().strip():
-            image = QImage(source.imageData())
-            if not image.isNull():
-                images.append(image)
-        return images
+        self.accept_documents = False
 
     def canInsertFromMimeData(self, source: QMimeData) -> bool:  # noqa: N802
-        return bool(self._images(source)) or super().canInsertFromMimeData(source)
+        documents = self.accept_documents and dropped_documents(source)
+        return bool(pasted_images(source)) or bool(documents) or super().canInsertFromMimeData(source)
 
     def insertFromMimeData(self, source: QMimeData) -> None:  # noqa: N802
-        images = self._images(source)
-        if not images:
+        images = pasted_images(source)
+        documents = dropped_documents(source) if self.accept_documents else []
+        if not images and not documents:
             super().insertFromMimeData(source)
             return
         for image in images:
             self.imagePasted.emit(image)
+        if documents:
+            self.documentsDropped.emit(documents)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         enter = event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)

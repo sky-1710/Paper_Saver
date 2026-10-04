@@ -202,3 +202,269 @@ def test_paste_prefers_text_over_its_picture(qapp) -> None:
     shot.setImageData(picture)
     edit.insertFromMimeData(shot)
     assert len(pasted) == 1 and edit.toPlainText() == "copied words"
+
+
+def test_sentences_go_to_the_gpt_tab(qapp, tmp_path: Path, two_column_pdf: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    from paper_saver.config import Settings
+    from paper_saver.ui.main_window import MainWindow, _prepare
+    from paper_saver.ui.reader_view import EXPLAIN_QUESTION
+
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("auto_translate", False)
+    window = MainWindow(settings)
+    project, layout = _prepare(two_column_pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    ids = [s.id for _, _, s in layout.sentences()]
+    project.translations.update({ids[0]: "합성 논문에 대한 연구"})
+    window._opened((project, layout))
+    qapp.processEvents()
+    reader = window.reader
+    engine = _FakeEngine()
+    reader._engine_provider = lambda: engine
+    first, second = reader.session.sentence(ids[0]), reader.session.sentence(ids[1])
+
+    # Gathered: two quotes on top, the reader's own words kept below them.
+    reader.chat_panel.input.setPlainText("둘의 관계는?")
+    reader.quote_to_gpt(ids[0])
+    reader.quote_to_gpt(ids[1])
+    text = reader.chat_panel.input.toPlainText()
+    lines = text.split("\n")
+    assert lines[0] == f"> p.{first.page + 1} · {' '.join(first.sentence.text.split())}"
+    assert lines[1] == "> (번역) 합성 논문에 대한 연구"
+    assert lines[2].startswith(f"> p.{second.page + 1} · ")
+    assert text.rstrip().endswith("둘의 관계는?")
+    assert reader.side.currentWidget() is reader.chat_panel
+    assert not engine.calls  # nothing is sent until the reader says so
+
+    # Asked at once, about the quoted sentence's page whatever page is in view.
+    reader.chat_panel.input.clear()
+    last = reader.session.page_count - 1
+    reader._page = last
+    reader.quote_to_gpt(ids[0], ask=True)
+    _wait(qapp, lambda: len(reader.chat_log.messages) == 2)
+    question = reader.chat_log.messages[0]
+    assert question.text.endswith(EXPLAIN_QUESTION) and question.page == first.page
+    assert ids[0] not in engine.calls[0][0] and "합성 논문에 대한 연구" in engine.calls[0][0]
+    window.close()
+
+
+def test_whole_paper_button_sends_every_page(qapp, tmp_path: Path, monkeypatch) -> None:
+    import pymupdf
+
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    from paper_saver.config import Settings
+    from paper_saver.ui.main_window import MainWindow, _prepare
+
+    pdf = tmp_path / "three.pdf"
+    doc = pymupdf.open()
+    for number in range(3):
+        page = doc.new_page(width=612, height=792)
+        page.insert_textbox(
+            pymupdf.Rect(60, 80, 552, 700),
+            f"Page {number + 1} studies topic {'ABC'[number]} in depth. It reports result {number + 1}.",
+            fontsize=11,
+        )
+    doc.save(pdf)
+
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("auto_translate", False)
+    window = MainWindow(settings)
+    window.resize(1400, 900)
+    window.show()
+    project, layout = _prepare(pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    window._opened((project, layout))
+    qapp.processEvents()
+    reader = window.reader
+    engine = _FakeEngine()
+    reader._engine_provider = lambda: engine
+
+    # Off: only the page in view goes.
+    reader.chat_panel.input.setPlainText("요약해줘")
+    reader.chat_panel.send()
+    _wait(qapp, lambda: len(reader.chat_log.messages) == 2)
+    assert "topic A" in engine.calls[0][0] and "topic C" not in engine.calls[0][0]
+
+    # On: every page, each headed, sentence tags numbered across the paper.
+    reader.chat_panel.set_scope("paper")
+    reader.chat_panel.input.setPlainText("논문 전체를 요약해줘")
+    reader.chat_panel.send()
+    _wait(qapp, lambda: len(reader.chat_log.messages) == 4)
+    prompt = engine.calls[1][0]
+    assert all(f"[p.{n}]" in prompt and f"topic {'ABC'[n - 1]}" in prompt for n in (1, 2, 3))
+    assert "논문 전체 본문" in prompt
+    window.close()
+
+
+def test_whole_paper_numbers_sentences_across_pages(qapp, tmp_path: Path, two_column_pdf: Path, monkeypatch) -> None:
+    import pymupdf
+
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    from paper_saver.config import Settings
+    from paper_saver.ui.main_window import MainWindow, _prepare
+
+    pdf = tmp_path / "twice.pdf"
+    doc = pymupdf.open()
+    for _ in range(2):
+        doc.insert_pdf(pymupdf.open(two_column_pdf))
+    doc.save(pdf)
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("auto_translate", False)
+    window = MainWindow(settings)
+    window.show()
+    project, layout = _prepare(pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    window._opened((project, layout))
+    qapp.processEvents()
+    reader = window.reader
+
+    _, first = reader._page_text(0)
+    text, numbering = reader._paper_text()
+    # One numbering for the paper: page 2's sentences follow page 1's.
+    assert len(numbering) == 2 * len(first) and len(set(numbering.values())) == len(numbering)
+    assert f"[S{len(numbering)}]" in text and text.index("[p.2]") < text.index(f"[S{len(first) + 1}]")
+    window.close()
+
+
+def test_files_and_other_papers_go_with_every_question(qapp, tmp_path: Path, two_column_pdf: Path, monkeypatch) -> None:
+    import pymupdf
+
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    from paper_saver.config import Settings
+    from paper_saver.ui.main_window import MainWindow, _prepare
+
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("auto_translate", False)
+    other_pdf = tmp_path / "other.pdf"
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), "The other paper proposes Zeta pooling.", fontsize=11)
+    doc.save(other_pdf)
+    other, _ = _prepare(other_pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    settings.add_recent_project(other.root)
+
+    window = MainWindow(settings)
+    window.show()
+    project, layout = _prepare(two_column_pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    window._opened((project, layout))
+    qapp.processEvents()
+    reader = window.reader
+    engine = _FakeEngine()
+    reader._engine_provider = lambda: engine
+
+    notes = tmp_path / "notes.md"
+    notes.write_text("Lecture says: Zeta pooling is a baseline.", encoding="utf-8")
+    reader.chat_panel.filesChosen.emit([notes])
+    _wait(qapp, lambda: len(reader.chat_log.files) == 1)
+    assert [title for title, _ in reader._recent_papers()] == [other.title]
+    reader.chat_panel.paperChosen.emit(str(other.root))
+    _wait(qapp, lambda: len(reader.chat_log.files) == 2)
+    assert reader.chat_panel._strip.isVisibleTo(reader.chat_panel)
+
+    for number, question in enumerate(("Zeta가 뭐야?", "다시 설명해줘"), start=1):
+        reader.chat_panel.input.setPlainText(question)
+        reader.chat_panel.send()
+        _wait(qapp, lambda n=number: len(reader.chat_log.messages) == 2 * n)
+        prompt = engine.calls[-1][0]
+        assert "[자료 1] notes.md" in prompt and "Zeta pooling is a baseline" in prompt
+        assert "(다른 논문)" in prompt and "The other paper proposes Zeta pooling" in prompt
+    assert reader.chat_log.messages[0].files == ["notes.md", other.title]
+
+    # Taken off, it goes no more.
+    reader.chat_panel._detach_file(reader.chat_log.files[0])
+    reader.chat_panel.input.setPlainText("이제는?")
+    reader.chat_panel.send()
+    _wait(qapp, lambda: len(reader.chat_log.messages) == 6)
+    assert "notes.md" not in engine.calls[-1][0]
+    window.close()
+
+
+class _CitesEachPaper:
+    """Answers citing the first sentence tag sent for paper 1, then for paper 2."""
+
+    supports_images = True
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def ask(self, prompt: str, *, images=(), cancel: threading.Event) -> str:  # type: ignore[no-untyped-def]
+        import re
+
+        self.calls.append(prompt)
+        first = re.search(r"\[S(\d+)\]", prompt[prompt.index("[논문 1]"):]).group(1)
+        second = re.search(r"\[S(\d+)\]", prompt[prompt.index("[논문 2]"):]).group(1)
+        return f"첫 논문은 이렇게 말합니다 [S{first}]. 둘째 논문은 다릅니다 [S{second}]."
+
+
+def test_papers_open_in_tabs_and_answers_light_each_tab(qapp, tmp_path: Path, two_column_pdf: Path, monkeypatch) -> None:
+    import pymupdf
+    from PySide6.QtCore import QUrl
+
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    from paper_saver.config import Settings
+    from paper_saver.ui.chat_panel import _ref_href
+    from paper_saver.ui.main_window import MainWindow, _prepare
+
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("auto_translate", False)
+    second_pdf = tmp_path / "second.pdf"
+    doc = pymupdf.open()
+    doc.insert_pdf(pymupdf.open(two_column_pdf))
+    doc.set_metadata({"title": "Second Synthetic Paper"})
+    doc.save(second_pdf)
+
+    window = MainWindow(settings)
+    window.resize(1400, 900)
+    window.show()
+    first, first_layout = _prepare(two_column_pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    second, second_layout = _prepare(second_pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    window._opened((first, first_layout))
+    window._opened((second, second_layout))
+    qapp.processEvents()
+    assert window.tabs.count() == 2 and window.reader.session.project.root == second.root
+    a, b = window.readers()
+
+    # Opening a paper already open shows its tab instead of a second copy.
+    window._opened((first, first_layout))
+    assert window.tabs.count() == 2 and window.reader is a
+
+    # Ask from the first paper about every open tab; the answer cites one
+    # sentence of each paper.
+    engine = _CitesEachPaper()
+    a._engine_provider = lambda: engine
+    a.chat_panel.set_scope("tabs")
+    a.chat_panel.input.setPlainText("Graph neural networks 차이는?")
+    a.chat_panel.send()
+    _wait(qapp, lambda: len(a.chat_log.messages) == 2)
+    prompt = engine.calls[0]
+    # The page in view, then each paper's opening and its matching passages -
+    # not whole papers.
+    assert "독자가 보고 있는 쪽(p.1)" in prompt and "[논문 2] " in prompt and "질문과 관련된 부분" in prompt
+    assert "논문 전체 본문" not in prompt
+
+    answer = a.chat_log.messages[1]
+    first_id = a._paper_text()[1][1]
+    assert answer.refs[0] == first_id and answer.refs[1].startswith(f"{b.paper_key}|")
+    second_id = answer.refs[1].split("|")[-1]
+    assert b.session.sentence(second_id) is not None
+    # Each paper lights its own sentence; the other tab is marked.
+    assert a.left._evidence == [first_id]
+    assert b.left._evidence == [second_id] and b.right._evidence == [second_id]
+    assert window.tabs.tabText(window.tabs.indexOf(b)).startswith("◆")
+    # The citation of the other paper is labelled with its title.
+    label = a._paper_label(f"{b.paper_key}|{second_id}")
+    assert label and label in a.chat_panel.view.toPlainText()
+
+    # Its note text names the other paper; its link brings that tab forward.
+    assert "p.1" in a._cite_pages([f"{b.paper_key}|{second_id}"])
+    a.chat_panel._link(QUrl(_ref_href([f"{b.paper_key}|{second_id}"])))
+    assert window.reader is b and not window.tabs.tabText(window.tabs.indexOf(b)).startswith("◆")
+
+    # Closing a tab leaves the other; closing the last goes back to the start.
+    window.close_paper()
+    assert window.readers() == [a] and window.stack.currentWidget() is window.tabs
+    window.close_paper()
+    assert window.readers() == [] and window.stack.currentWidget() is window.start
+    window.close()

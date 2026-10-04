@@ -6,6 +6,10 @@ can have several; the ones it has had are listed at the top. Captures and
 pasted screenshots are saved into ``assets/`` beside the file and linked
 where the cursor is, so the note reads the same in any Markdown editor.
 
+There is no preview: the editor formats as it is typed (``# `` becomes a
+heading, ``**`` bold, an image link the picture) while the text stays the
+Markdown the file holds - see ``live_markdown``.
+
 It saves itself 0.7 s after the last keystroke and when the paper closes
 (§4.3). If another program changed the file meanwhile, that version is kept
 beside it before this one is written, and reloaded quietly when this side has
@@ -37,8 +41,6 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
-    QStackedWidget,
-    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -50,7 +52,8 @@ from ..core.notebook import ASSETS_DIR, copy_linked_images, image_link, read_not
 from ..core.notion import NotionClient, NotionError, export_markdown, page_id_from
 from ..core.project import Project
 from .keys import CAPTURE_LABEL, PASTE_LABEL
-from .markdown_view import ImagePasteEdit, markdown_html, save_png
+from .live_markdown import LiveMarkdownEdit
+from .markdown_view import save_png
 from .workers import BackgroundTask
 
 log = logging.getLogger(__name__)
@@ -131,9 +134,6 @@ class NotePanel(QWidget):
         more_button.setMenu(more)
         more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
 
-        self.preview_button = QPushButton("미리보기")
-        self.preview_button.setCheckable(True)
-        self.preview_button.toggled.connect(self._toggle_preview)
         self.notion_button = QPushButton("Notion으로")
         self.notion_button.setToolTip("이 노트를 이미지까지 Notion 페이지로 보냅니다")
         self.notion_button.clicked.connect(self.export_notion)
@@ -141,22 +141,17 @@ class NotePanel(QWidget):
         top = QHBoxLayout()
         top.addWidget(self.files, 1)
         top.addWidget(more_button)
-        top.addWidget(self.preview_button)
         top.addWidget(self.notion_button)
 
-        self.editor = ImagePasteEdit()
+        self.editor = LiveMarkdownEdit()
         self.editor.setPlaceholderText(
-            f"Markdown 노트. 캡처({CAPTURE_LABEL}) → '노트에 붙이기', 또는 스크린샷을 {PASTE_LABEL}로 붙여 넣으세요.\n"
+            "Markdown으로 적으면 바로 서식이 됩니다: # 제목, **굵게**, *기울임*, - 목록, - [ ] 할 일, > 인용, `코드`.\n"
+            f"캡처({CAPTURE_LABEL}) → '노트에 붙이기', 또는 스크린샷을 {PASTE_LABEL}로 붙여 넣으면 그림이 들어갑니다.\n"
             "자동 저장됩니다. 저장 위치는 '파일 ▾ → 다른 곳에 저장'으로 자유롭게 바꿀 수 있습니다."
         )
-        self.editor.textChanged.connect(self._changed)
+        self.editor.edited.connect(self._changed)
         self.editor.imagePasted.connect(lambda image: self.insert_image(image, "붙여 넣은 이미지"))
         self.editor.focusedIn.connect(self.check_external)
-        self.preview = QTextBrowser()
-        self.preview.setOpenExternalLinks(True)
-        self.stack = QStackedWidget()
-        self.stack.addWidget(self.editor)
-        self.stack.addWidget(self.preview)
 
         self.status = QLabel()
         self.status.setObjectName("muted")
@@ -170,7 +165,7 @@ class NotePanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addLayout(top)
-        layout.addWidget(self.stack, 1)
+        layout.addWidget(self.editor, 1)
         layout.addWidget(self.status)
         self._load(self.path)
 
@@ -219,12 +214,11 @@ class NotePanel(QWidget):
         text, self._mtime = read_note(path)
         self.path = path
         self._loading = True
+        self.editor.base_dir = path.parent
         self.editor.setPlainText(text)
         self._loading = False
         self._dirty = False
         self._refresh_files()
-        if self.preview_button.isChecked():
-            self._render_preview()
         self._say(f"{path}" if path.is_file() else "새 노트 — 입력하면 저장됩니다")
 
     # -- saving ------------------------------------------------------------------------
@@ -323,6 +317,7 @@ class NotePanel(QWidget):
             QMessageBox.warning(self, "노트", f"저장하지 못했습니다:\n{exc}")
             return
         self.path, self._dirty = path, False
+        self.editor.base_dir = path.parent
         self._remember()
         self._refresh_files()
         extra = f" · 이미지 {len(copied)}개 함께 복사" if copied else ""
@@ -361,8 +356,6 @@ class NotePanel(QWidget):
 
     def _insert_block(self, markdown: str) -> None:
         """Put a block of Markdown on lines of its own at the cursor."""
-        if self.preview_button.isChecked():
-            self.preview_button.setChecked(False)
         cursor = self.editor.textCursor()
         before = self.editor.toPlainText()[: cursor.position()]
         prefix = "" if not before or before.endswith("\n\n") else ("\n" if before.endswith("\n") else "\n\n")
@@ -374,26 +367,6 @@ class NotePanel(QWidget):
         """Add a block at the end of the note (an answer from the GPT tab)."""
         self.editor.moveCursor(QTextCursor.MoveOperation.End)
         self._insert_block(markdown.strip())
-
-    # -- preview -----------------------------------------------------------------------
-
-    def _toggle_preview(self, on: bool) -> None:
-        if on:
-            # Shown first, then drawn: images are fitted to the width it has.
-            self.stack.setCurrentWidget(self.preview)
-            QTimer.singleShot(0, self._render_preview)
-        else:
-            self.stack.setCurrentWidget(self.editor)
-            self.editor.setFocus()
-
-    def resizeEvent(self, event: object) -> None:  # noqa: N802
-        super().resizeEvent(event)  # type: ignore[arg-type]
-        if self.preview_button.isChecked():
-            QTimer.singleShot(0, self._render_preview)
-
-    def _render_preview(self) -> None:
-        width = max(160, self.preview.viewport().width() - 30)
-        self.preview.setHtml(markdown_html(self.editor.toPlainText(), self.path.parent, width))
 
     # -- Notion ------------------------------------------------------------------------
 

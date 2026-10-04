@@ -117,6 +117,10 @@ class TranslationStore:
                 pass
             data = {}
         self._items: dict[str, str] = dict(data.get("sentences", {}))
+        #: Sentences OpenAI refused to translate even on their own (a grading
+        #: prompt quoted in an appendix). Left in English and not asked for
+        #: again, so opening the paper does not fail on them every time.
+        self._refused: set[str] = set(data.get("refused", []))
         self.engine: str = data.get("engine", "")
         self.model: str = data.get("model", "")
         self._keys: dict[str, str] = {}
@@ -154,6 +158,21 @@ class TranslationStore:
         with self._lock:
             return len(self._items)
 
+    def refused(self, sentence_id: str) -> bool:
+        with self._lock:
+            return self._key(sentence_id) in self._refused
+
+    def settled(self, sentence_id: str) -> bool:
+        """Translated, or refused and left as it is: nothing more to ask."""
+        with self._lock:
+            key = self._key(sentence_id)
+            return key in self._items or key in self._refused
+
+    def refuse(self, sentence_ids: list[str]) -> None:
+        with self._lock:
+            self._refused.update(self._key(i) for i in sentence_ids)
+        self.update({})
+
     def update(self, items: dict[str, str], *, engine: str = "", model: str = "") -> None:
         with self._lock:
             for sentence_id, text in items.items():
@@ -168,6 +187,7 @@ class TranslationStore:
                 "model": self.model,
                 "updated": _now(),
                 "sentences": dict(self._items),
+                "refused": sorted(self._refused),
             }
         write_json_atomic(self.path, data)
 
@@ -288,6 +308,9 @@ class Stroke:
     text: str
     color: str
     created: str = field(default_factory=_now)
+    #: The sentence the stroke starts in, if it starts in one: where the
+    #: bookmark list jumps to and whose notes it shows.
+    sentence_id: str = ""
 
 
 class Highlights:
@@ -325,8 +348,10 @@ class Highlights:
             },
         )
 
-    def add_stroke(self, side: str, page: int, rects: list[list[float]], text: str, color: str) -> Stroke:
-        stroke = Stroke(uuid.uuid4().hex[:10], side, page, rects, text, color)
+    def add_stroke(
+        self, side: str, page: int, rects: list[list[float]], text: str, color: str, sentence_id: str = ""
+    ) -> Stroke:
+        stroke = Stroke(uuid.uuid4().hex[:10], side, page, rects, text, color, sentence_id=sentence_id)
         self.strokes.append(stroke)
         self.save()
         return stroke
@@ -548,5 +573,11 @@ class Project:
         write_json_atomic(self.root / self.LAYOUT, layout.to_dict(), indent=0)
 
     def set_meta(self, **values: Any) -> None:
+        # The start screen files the paper into a folder by writing paper.json
+        # while the paper may be open here; start from what is on disk so
+        # that is not written back over.
+        on_disk = _read(self.root / self.META, None)
+        if isinstance(on_disk, dict):
+            self.meta = on_disk
         self.meta.update(values)
         write_json_atomic(self.root / self.META, self.meta)

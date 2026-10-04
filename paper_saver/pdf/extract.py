@@ -164,6 +164,25 @@ def _span_rect(chars: Sequence[_Char], fallback: Any) -> Rect:
     return merged if merged is not None else Rect.from_list(fallback)
 
 
+def _column_evidence(spans: Sequence[_Span], protected: Sequence[Rect]) -> list[Rect]:
+    """The rectangles columns are judged by: text outside figures.
+
+    The labels inside a full-width figure sit wherever the drawing put them,
+    gutter included. On a page whose top half is one wide diagram ("RAG over
+    Thinking Traces", p.2) a dozen of them crossed the gutter, the page came
+    out as one column, and every line below the figure joined its left half
+    to its right. A text-heavy figure (a case study, a big results table)
+    can hold most of the page's words, so the share inside is no reason to
+    keep them; but a drawing that frames most of the page is no figure, and
+    too little text left to judge by means using it all.
+    """
+    content = union_all(s.rect for s in spans)
+    room = content.width * content.height if content is not None else 0.0
+    figures = [r for r in protected if r.width * r.height < room * 0.7]
+    outside = [s.rect for s in spans if not any(r.contains(s.rect.cx, s.rect.cy) for r in figures)]
+    return outside if len(outside) >= 12 else [s.rect for s in spans]
+
+
 def _page_spans(page: Any) -> list[_Span]:
     """Every span of the page with its characters, ignoring PyMuPDF's blocks.
 
@@ -370,6 +389,7 @@ def _group_lines(spans: Sequence[_Span], context: _PageContext) -> list[_Line]:
     for row in _baseline_rows(ordinary, context):
         for column, piece in _split_row(row, context):
             per_column.setdefault(column, []).append(piece)
+    _lift_wide_decorations(per_column, context)
     _place_drop_caps(caps, per_column, context)
 
     lines: list[_Line] = []
@@ -378,6 +398,37 @@ def _group_lines(spans: Sequence[_Span], context: _PageContext) -> list[_Line]:
     lines.sort(key=lambda line: (line.baseline, line.rect.x0))
     _attach_short_last_lines(lines, context)
     return lines
+
+
+def _lift_wide_decorations(per_column: dict[int, list[list[_Span]]], context: _PageContext) -> None:
+    """Send a superscript of a full-width line to that line's column.
+
+    A raised "³" sits on a baseline of its own, so it is a row of its own, and
+    being small it falls inside one column - while the caption line it
+    decorates crosses the gutter and is filed as full width. Decorations are
+    folded into their line one column at a time, so the two never met and the
+    "³" came out as a line of its own, read before "Figure 1" ("RAG over
+    Thinking Traces", p.2). A formula-only row that overlaps a full-width line
+    vertically, within its width, is moved to that line's column.
+    """
+    wide = [box for row in per_column.get(-1, []) if (box := union_all(s.rect for s in row)) is not None]
+    if not wide:
+        return
+    for column in [c for c in per_column if c >= 0]:
+        kept = []
+        for row in per_column[column]:
+            box = union_all(s.rect for s in row)
+            lifted = (
+                box is not None
+                and not _has_prose(row)
+                and box.height <= context.body_size * 2.6
+                and any(
+                    min(box.y1, line.y1) - max(box.y0, line.y0) > box.height * 0.3 and line.x0 <= box.cx <= line.x1
+                    for line in wide
+                )
+            )
+            (per_column[-1] if lifted else kept).append(row)
+        per_column[column] = kept
 
 
 def _attach_short_last_lines(lines: list[_Line], context: _PageContext) -> None:
@@ -851,7 +902,10 @@ def _sentences_of(words: Sequence[Word], text: str, block_id: str) -> list[Sente
 
 _CAPTION_RE = re.compile(
     r"^\s*(fig(?:ure)?s?|tab(?:le)?s?|alg(?:orithm)?s?|listing|scheme|chart)"
-    r"\s*\.?\s*(\d+|[IVXL]+)\b",
+    r"\s*\.?\s*(\d+|[IVXL]+)\b"
+    # "Figure 1 illustrates…" is a sentence about the figure, not its caption:
+    # a caption goes on with punctuation or a capital ("Table 1 Results").
+    r"(?!\s+(?-i:[a-z]))",
     re.IGNORECASE,
 )
 _REFERENCES_RE = re.compile(
@@ -1095,14 +1149,15 @@ def extract_page(page: Any, number: int) -> PageLayout:
 
     body_font, body_size = _dominant_body(spans)
     _mark_math(spans, body_font, body_size)
-    columns = detect_columns(page_rect, [span.rect for span in spans], body_size=body_size)
+    protected = protected_regions(page)
+    columns = detect_columns(page_rect, _column_evidence(spans, protected), body_size=body_size)
     context = _PageContext(
         number=number,
         rect=page_rect,
         body_size=body_size,
         body_font=body_font,
         columns=columns,
-        protected=protected_regions(page),
+        protected=protected,
         first_page=number == 0,
     )
 

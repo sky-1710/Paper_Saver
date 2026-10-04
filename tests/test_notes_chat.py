@@ -276,3 +276,42 @@ def test_notion_explains_an_unshared_page() -> None:
 
     with pytest.raises(NotionError, match="연결"):
         export_markdown(NotionClient("s", transport, backoff=0), "a" * 32, "hi", Path("."))
+
+
+def test_chat_prompt_with_the_whole_paper() -> None:
+    from paper_saver.translate.prompts import CHAT_PAGE_CHARS, chat_prompt
+
+    paper = "[p.1]\nIntro.\n\n[p.2]\n" + "x" * (CHAT_PAGE_CHARS * 3)
+    prompt = chat_prompt("요약해줘", page_label="p.2", page_text=paper, whole_paper=True)
+    assert "논문 전체 본문" in prompt and "p.2을(를) 보고 있습니다" in prompt
+    assert "이하 생략" not in prompt  # the page limit does not cut the paper
+    assert "이하 생략" in chat_prompt("?", page_text=paper)
+
+
+def test_attached_files_are_kept_sent_and_taken_off(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from paper_saver.core.chat import ChatLog
+    from paper_saver.translate.prompts import CHAT_FILE_CHARS, chat_prompt
+
+    source = tmp_path / "lecture notes.txt"
+    source.write_text("Attention weights sum to one.", encoding="utf-8")
+    log = ChatLog(tmp_path / "project" / "chat.json")
+    item = log.import_file(source, "Attention weights sum to one.")
+    assert log.files == []  # importing alone changes nothing a worker could race
+    log.attach_file(item)
+    log.attach_file(log.import_paper("Other Paper", "[p.1]\nWe propose X.", tmp_path / "other"))
+    assert log.has_source(source) and log.has_source(tmp_path / "other")
+
+    reopened = ChatLog(tmp_path / "project" / "chat.json")
+    assert [f.name for f in reopened.files] == ["lecture notes.txt", "Other Paper"]
+    assert reopened.file_text(reopened.files[0]) == "Attention weights sum to one."
+    reopened.add("user", "q", files=["lecture notes.txt"])
+    reopened.clear()
+    assert len(reopened.files) == 2  # a new conversation keeps its material
+
+    prompt = chat_prompt("비교해줘", documents=[("lecture notes.txt", "Attention"), ("Other (다른 논문)", "x" * (CHAT_FILE_CHARS + 50))])
+    assert "[자료 1] lecture notes.txt" in prompt and "[자료 2] Other (다른 논문)" in prompt and "이하 생략" in prompt
+
+    copy = reopened.absolute(reopened.files[0].file)
+    assert copy.is_file()
+    reopened.detach_file(reopened.files[0].id)
+    assert not copy.is_file() and [f.name for f in ChatLog(tmp_path / "project" / "chat.json").files] == ["Other Paper"]

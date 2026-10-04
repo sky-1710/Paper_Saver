@@ -45,6 +45,19 @@ Every flag there is load-bearing:
     tools, so the whole file is skipped. Their sign-in is not in it - auth
     comes from ``CODEX_HOME`` and still applies.
 
+Questions to GPT are the one exception to ``--ephemeral`` (§4b.2): a
+conversation runs in one Codex session, continued with::
+
+    codex exec resume --skip-git-repo-check --ignore-user-config --json \\
+               --output-last-message ANSWER.md SESSION_ID -
+
+so a follow-up carries only what is new, and OpenAI's prompt cache serves
+what the session already holds (measured: a third question hit the cache for
+99% of its input; separate runs never hit it beyond Codex's own preamble).
+The session keeps the read-only sandbox it was started with. Its file in
+``CODEX_HOME/sessions`` is deleted by :meth:`forget_session` when the reader
+starts a new conversation or takes an attached file off.
+
 Both stdin and the answer file are UTF-8 explicitly: the Windows default is
 cp949 here, which mangles Korean.
 """
@@ -54,10 +67,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +82,7 @@ from .engine import (
     EngineAuthError,
     EngineAvailability,
     EngineNotFoundError,
+    EnginePromptRejected,
     EngineRateLimited,
     TranslationCancelled,
     TranslationEngine,
@@ -191,8 +207,19 @@ class CodexEngine(TranslationEngine):
 
     #: Explicit path to the program, when the user set one.
     binary: str | Path | None = None
-    #: Passed to ``-m``. Empty means whatever Codex is configured to use.
+    #: Passed to ``-m`` for translation and dictionary look-ups: many small
+    #: runs, where a light model ("gpt-6-luna") saves most of the usage.
+    #: Empty means Codex's own default.
     model: str = ""
+    #: The same for questions to GPT and quizzes, which need more thought.
+    chat_model: str = ""
+    #: Reasoning effort ("low", "medium", ...) for each kind of run, passed as
+    #: ``-c model_reasoning_effort=...``; empty leaves the model's default.
+    #: Measured on a real batch: luna at "low" translated as well as at
+    #: "medium", 30% faster.
+    effort: str = ""
+    chat_effort: str = ""
+    quiz_effort: str = ""
     timeout: int = BATCH_TIMEOUT_SECONDS
 
     def resolve(self) -> Path:
@@ -236,14 +263,36 @@ class CodexEngine(TranslationEngine):
         return EngineAvailability(ready=True, detail=version[0] if version else str(path))
 
     def _command(
-        self, path: Path, answer_file: Path, images: Sequence[Path] = (), schema_file: Path | None = None
+        self,
+        path: Path,
+        answer_file: Path,
+        images: Sequence[Path] = (),
+        schema_file: Path | None = None,
+        *,
+        keep: bool = False,
+        resume: str | None = None,
+        model: str = "",
+        effort: str = "",
     ) -> list[str]:
+        tuning = ["-c", f'model_reasoning_effort="{effort}"'] if effort.isalpha() else []
+        if resume:
+            # ``resume`` takes no --sandbox or --color: the session keeps the
+            # read-only sandbox it was started with.
+            cmd = [str(path), "exec", "resume"]
+            for image in images:
+                cmd += ["--image", str(image)]
+            cmd += ["--skip-git-repo-check", "--ignore-user-config", "--json",
+                    "--output-last-message", str(answer_file)]
+            if model:
+                cmd += ["-m", model]
+            return [*cmd, *tuning, resume, "-"]
         cmd = [str(path), "exec"]
         for image in images:
             cmd += ["--image", str(image)]
+        cmd += ["--skip-git-repo-check"]
+        # A kept session is the start of a conversation; --json reports its id.
+        cmd += ["--json"] if keep else ["--ephemeral"]
         cmd += [
-            "--skip-git-repo-check",
-            "--ephemeral",
             "--ignore-user-config",
             "--sandbox", "read-only",
             "--color", "never",
@@ -251,19 +300,39 @@ class CodexEngine(TranslationEngine):
         ]
         if schema_file is not None:
             cmd += ["--output-schema", str(schema_file)]
-        if self.model:
-            cmd += ["-m", self.model]
+        if model:
+            cmd += ["-m", model]
         # A trailing "-" tells Codex the prompt arrives on stdin.
-        return [*cmd, "-"]
+        return [*cmd, *tuning, "-"]
 
     def translate(self, prompt: str, *, cancel: threading.Event) -> str:
-        return self._run(prompt, (), cancel)
+        return self._run(prompt, (), cancel, model=self.model, effort=self.effort)
 
     def ask(self, prompt: str, *, images: Sequence[Path] = (), cancel: threading.Event) -> str:
         missing = [str(p) for p in images if not Path(p).is_file()]
         if missing:
             raise TranslationError("첨부한 캡처 파일을 찾을 수 없습니다:\n" + "\n".join(missing))
-        return self._run(prompt, [Path(p).resolve() for p in images], cancel)
+        return self._run(
+            prompt, [Path(p).resolve() for p in images], cancel, model=self.chat_model, effort=self.chat_effort
+        )
+
+    supports_sessions: bool = True
+
+    def converse(
+        self, prompt: str, *, session: str | None = None, images: Sequence[Path] = (), cancel: threading.Event
+    ) -> tuple[str, str | None]:
+        missing = [str(p) for p in images if not Path(p).is_file()]
+        if missing:
+            raise TranslationError("첨부한 캡처 파일을 찾을 수 없습니다:\n" + "\n".join(missing))
+        found: list[str] = []
+        answer = self._run(
+            prompt, [Path(p).resolve() for p in images], cancel, keep=True, resume=session, session_out=found,
+            model=self.chat_model, effort=self.chat_effort,
+        )
+        return answer, session or (found[0] if found else None)
+
+    def forget_session(self, session: str) -> None:
+        forget_codex_session(session)
 
     def generate_json(
         self,
@@ -276,7 +345,10 @@ class CodexEngine(TranslationEngine):
         missing = [str(p) for p in images if not Path(p).is_file()]
         if missing:
             raise TranslationError("첨부할 이미지 파일을 찾을 수 없습니다:\n" + "\n".join(missing))
-        return self._run(prompt, [Path(p).resolve() for p in images], cancel, schema=schema)
+        return self._run(
+            prompt, [Path(p).resolve() for p in images], cancel, schema=schema, model=self.chat_model,
+            effort=self.quiz_effort,
+        )
 
     def _run(
         self,
@@ -285,6 +357,11 @@ class CodexEngine(TranslationEngine):
         cancel: threading.Event,
         *,
         schema: Mapping[str, Any] | None = None,
+        keep: bool = False,
+        resume: str | None = None,
+        session_out: list[str] | None = None,
+        model: str = "",
+        effort: str = "",
     ) -> str:
         path = self.resolve()
         # Codex treats its working directory as the workspace root. A scratch
@@ -302,7 +379,7 @@ class CodexEngine(TranslationEngine):
                 schema_file.write_text(json.dumps(schema), encoding="utf-8")
             try:
                 process = subprocess.Popen(
-                    self._command(path, answer_file, images, schema_file),
+                    self._command(path, answer_file, images, schema_file, keep=keep, resume=resume, model=model, effort=effort),
                     cwd=str(workspace),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
@@ -313,11 +390,24 @@ class CodexEngine(TranslationEngine):
             except OSError as exc:
                 raise TranslationError(f"Codex could not be started:\n{exc}") from exc
 
-            stdout, stderr = self._communicate(process, prompt, cancel)
+            try:
+                stdout, stderr = self._communicate(process, prompt, cancel)
+            except TranslationError:
+                # Stopped before it said its id: find the new session by the
+                # scratch folder it ran in, which no other run shares.
+                if keep and not resume:
+                    _forget_sessions_in(workspace)
+                raise
 
             if process.returncode != 0:
+                # A new session whose first turn failed is no conversation:
+                # its file would only sit in CODEX_HOME holding the text.
+                if keep and not resume and (thread := _thread_id(stdout)):
+                    forget_codex_session(thread)
                 raise self._failure(process.returncode, stdout, stderr)
-            answer = self._read_answer(answer_file, stdout)
+            if session_out is not None and (thread := _thread_id(stdout)):
+                session_out.append(thread)
+            answer = self._read_answer(answer_file, "" if keep or resume else stdout)
             if not answer.strip():
                 raise TranslationError(
                     "Codex finished but returned nothing to translate with.\n\n"
@@ -383,6 +473,14 @@ class CodexEngine(TranslationEngine):
         combined = f"{stderr}\n{stdout}".lower()
         tail = (stderr.strip() or stdout.strip())[-800:]
 
+        # First: its wording mentions none of the words below, but the JSON
+        # around it could ("error", a link), and it needs its own handling.
+        if "invalid_prompt" in combined or "flagged as potentially violating" in combined:
+            return EnginePromptRejected(
+                "OpenAI가 이번에 보낸 글을 사용 정책 위반 가능성으로 거절했습니다.\n\n"
+                "논문 본문에 실린 평가용 프롬프트·채점 지시문·위험한 질문 예시 같은 "
+                "인용문 때문인 경우가 대부분입니다 (예: DeepSeek-R1 논문의 부록 표)."
+            )
         signed_out = ("not logged in", "unauthorized", "please run codex login",
                       "authentication")
         if any(word in combined for word in signed_out):
@@ -412,3 +510,90 @@ class CodexEngine(TranslationEngine):
                 f"and try again.\n\n{tail}"
             )
         return TranslationError(f"Codex failed (exit code {returncode}).\n\n{tail}")
+
+
+def _thread_id(stdout: str) -> str | None:
+    """The session id in ``--json`` output (its "thread.started" event)."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("thread_id"):
+            return str(event["thread_id"])
+    return None
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def forget_codex_session(session: str) -> int:
+    """Delete a session's files from ``CODEX_HOME``; how many went.
+
+    Codex names them ``rollout-<time>-<session id>.jsonl`` under
+    ``sessions/<year>/<month>/<day>/``. Only names ending in this id are
+    touched, and an id is checked to look like one first.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F-]{16,64}", session or ""):
+        return 0
+    removed = 0
+    for folder in ("sessions", "archived_sessions"):
+        root = codex_home() / folder
+        if not root.is_dir():
+            continue
+        for path in root.rglob(f"*{session}.jsonl"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                log.warning("Could not delete Codex session file %s", path, exc_info=True)
+    return removed
+
+
+def _forget_sessions_in(workspace: Path) -> int:
+    """Delete today's session files whose run had ``workspace`` as its folder.
+
+    Each run gets a scratch folder of its own, and Codex writes it into the
+    first line of the session file (``"cwd"``), so the match is exact.
+    """
+    root = codex_home() / "sessions"
+    if not root.is_dir():
+        return 0
+    needle = json.dumps(str(workspace))[1:-1]  # as it is escaped in the file
+    removed = 0
+    cutoff = time.time() - 6 * 3600
+    for path in root.rglob("rollout-*.jsonl"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                first = handle.readline(8192)
+            if needle in first:
+                path.unlink()
+                removed += 1
+        except OSError:
+            log.warning("Could not check Codex session file %s", path, exc_info=True)
+    return removed
+
+
+def available_models() -> list[tuple[str, str, str]]:
+    """The models this Codex offers the signed-in account: (id, name, note).
+
+    Read from the list Codex itself keeps (``models_cache.json``), so it is
+    the account's real choice; empty when Codex has not fetched one yet.
+    """
+    path = codex_home() / "models_cache.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    models = []
+    for item in data.get("models") or []:
+        if not isinstance(item, dict) or item.get("visibility") != "list" or not item.get("slug"):
+            continue
+        models.append((str(item["slug"]), str(item.get("display_name") or item["slug"]), str(item.get("description") or "")))
+    return models

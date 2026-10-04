@@ -374,7 +374,7 @@ class QuizPanel(QWidget):
         else:
             self._draw_quiz(quiz, self.store.attempt(self.slide))
         self._body_layout.addStretch(1)
-        QTimer.singleShot(0, lambda: bar.setValue(keep))
+        QTimer.singleShot(0, bar, lambda: bar.setValue(keep))
 
     def _add(self, widget: QWidget) -> QWidget:
         self._body_layout.addWidget(widget)

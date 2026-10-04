@@ -38,6 +38,16 @@ figure/table captions. What is left as original pixels: anything inside a
 figure or plot, table cells, display equations, author and affiliation lines,
 the reference list, headers and footers.
 
+§1.5 Several papers can be open at once, each in a tab of its own with its own
+panes, notes, conversation and translation; opening one already open shows
+its tab.
+
+§1.6 The start screen lists the papers by folder, not by recency (recent
+papers come first within a folder). A folder is a label written into the
+paper's `paper.json`, never a directory the project is moved into, so
+nothing that refers to a project folder breaks; the folder list and its order
+live in `<Projects>/library.json`, so an empty folder stays.
+
 ---
 
 ## 2. LINKED SENTENCES
@@ -86,6 +96,15 @@ beside it and are linked relatively, so the file reads the same in any
 Markdown tool; moving the note copies the pictures it links. A save never
 silently overwrites an edit made in another program: that version is kept
 beside the note first.
+The note has no preview: Markdown is drawn formatted as it is typed (markers
+show only on the line being edited, an image link is drawn as the picture),
+while the text stays the exact Markdown the file holds - never rewritten.
+
+§4.6 Every highlight is a bookmark. The 북마크 tab lists them in reading
+order - a whole sentence with its translation, a dragged stroke with what it
+covers - each with the notes on its sentence shown right beneath it. A stroke
+remembers the sentence it starts in, which is where it jumps and whose notes
+it shows.
 
 §4.5 Notion export: on the reader's press only, the note becomes a child page
 of a Notion page they chose, images uploaded. Re-exporting replaces the old
@@ -100,10 +119,27 @@ page. The region is re-rendered from the PDF at up to 3x, not grabbed from
 the screen, so small print stays legible whatever the zoom.
 
 §4b.2 A capture can be asked about (GPT tab), pasted into the note, or copied.
-The GPT tab is a per-paper conversation (`chat.json`); each question carries
-the page in view, the recent turns and the attached captures. A follow-up
-without a picture re-sends the latest captures, since every Codex run starts
-fresh.
+The GPT tab is a per-paper conversation (`chat.json`) run in one Codex
+session (`codex exec resume`): text goes once per session and a follow-up
+carries only what is new, while OpenAI's prompt cache serves what the session
+holds. What goes is the reader's pick: the page in view; "이 논문", the whole
+paper; or "모든 탭", the page in view plus each open paper's opening and the
+paragraphs matching the question (English and Korean; an outline when
+nothing matches) - never several whole papers. Sentence tags are numbered
+across the session, and `chat.json` keeps what was sent. A session that cannot
+be resumed is replaced by a fresh one carrying everything, with the recent
+turns and the latest captures. An answer citing another open paper lights
+that sentence in its own tab, the tab is marked ◆, and the citation link
+brings it forward. A sentence can be quoted into the question from its menu
+or with Ctrl+G on hover (original and translation, gathered above what the
+reader typed); a quoted sentence's page is the page the question is about.
+
+§4b.3 Files can be attached to the conversation (📎, or dropped on the
+input): PDF, txt, md, srt, vtt - or another paper the reader has opened,
+taken from its layout. They are copied into `chat_files/` with their text
+beside it and stay attached, going with every question as [자료 N], until the
+reader takes them off (which also ends the session, since it holds them);
+clearing the conversation keeps them.
 
 ---
 
@@ -138,28 +174,47 @@ reader presses Regenerate.
 
 §5.1 Translation goes through the Codex CLI, signed in with the user's ChatGPT
 account: no API key, no per-token bill. `codex exec` is run non-interactively
-with the prompt on stdin and the answer written to a file.
+with the prompt on stdin and the answer written to a file. Two models can be
+set: one for translation and dictionary look-ups, one for GPT questions and
+quizzes. Unless the reader picks otherwise they are gpt-6-luna (low effort -
+many small sentence-level runs, measured to translate as well as at medium)
+and gpt-6.1-sol (low for questions, medium for quizzes, whose answer key must
+be right). A model Codex no longer offers falls back to Codex's default.
 
 §5.2 The engine is one class behind an interface, exactly as in Lecture Saver,
 so an OpenAI-API engine or a local model is an added file rather than a change.
 
 §5.3 Translation sends the paper's *text* to OpenAI. This is stated plainly
 before the first run. The only other thing that goes is a capture the reader
-explicitly attached to a question (`codex exec --image`), and, for a quiz, the
+explicitly attached to a question (`codex exec --image`), the text of a file
+the reader explicitly attached to the conversation (§4b.3), and, for a quiz, the
 slide's text, its matched STT excerpt and the style examples — plus the
 slide's picture only if the reader turned that on. The PDF itself and the
 reader's notes never go to OpenAI; a note goes to Notion only on export.
+Translation and dictionary runs leave nothing on disk (`--ephemeral`); the
+session file Codex keeps for a GPT conversation is deleted when the reader
+starts a new conversation or takes off a file it was sent.
 
 §5.4 Results are written to disk per page as they arrive. Reopening a paper
 that was translated last week is instant and costs nothing, and a translation
 interrupted halfway resumes where it stopped.
 
+§5.5 Usage is spent on the answer more than the question, so a batch is
+asked for and answered as numbered lines (`[3] 번역`), not JSON keyed by
+sentence id. Codex's own flags stay as they are: trimming its instructions or
+tools breaks the prompt cache it shares, and costs more (measured).
+An opt-in read-ahead translates only the page in view and a few after it,
+following the reader; "번역 시작" and a translated-PDF export still translate
+the whole paper.
+
 ---
 
 ## 6. PROJECT FOLDER
 
+    <Projects>/library.json     the start screen's folders, in order
     <Projects>/<paper title>/
-        paper.json          source, page count, page sizes
+        paper.json          source, page count, page sizes, folder
+        highlights.json     highlighted sentences and strokes (the bookmarks)
         paper.pdf           the PDF, copied in (papers are small; be self-contained)
         layout.json         blocks, sentences, word boxes per page
         translation.json    sentence id → Korean, with engine and model
@@ -167,6 +222,7 @@ interrupted halfway resumes where it stopped.
         wordbook.json       starred words
         chat.json           the GPT conversation
         captures/           captures attached to questions
+        chat_files/         files attached to the conversation, with their text
         quiz.json           slide quizzes, answers, the list of quiz materials
         quiz/materials/     the STT and style references, copied in, with their text
         note.md, assets/    the Markdown note, until the reader moves it

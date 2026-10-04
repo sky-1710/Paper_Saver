@@ -26,6 +26,7 @@ from ..core.models import BlockKind, PaperLayout
 from ..core.project import TranslationStore
 from .engine import (
     EngineAuthError,
+    EnginePromptRejected,
     EngineRateLimited,
     TranslationCancelled,
     TranslationEngine,
@@ -97,7 +98,7 @@ def pending_batches(
                 continue
             kind = _KIND.get(block.kind, "body")
             for sentence in block.sentences:
-                if sentence.id in store:
+                if store.settled(sentence.id):
                     continue
                 if current and size + len(sentence.text) > max_chars:
                     batches.append(Batch(number, tuple(current)))
@@ -111,16 +112,47 @@ def pending_batches(
 
 def _run_batch(
     batch: Batch, engine: TranslationEngine, title: str, cancel: threading.Event
-) -> dict[str, str]:
-    """One batch, with one retry for whatever the first answer left out."""
-    answer = engine.translate(batch_prompt(batch.sentences, context=title), cancel=cancel)
+) -> tuple[dict[str, str], list[str]]:
+    """One batch, with one retry for whatever the first answer left out.
+
+    Returns the translations and the ids OpenAI refused. A refused batch is
+    split in half and each half tried, so one quoted grading prompt costs its
+    own sentences, not the page around it.
+    """
+    try:
+        answer = engine.translate(batch_prompt(batch.sentences, context=title), cancel=cancel)
+    except EnginePromptRejected:
+        return _split(batch, engine, title, cancel)
     result = parse_batch(answer, batch.ids)
     missing = [s for s in batch.sentences if s.id not in result]
     if missing and not cancel.is_set():
         log.info("Page %s: %d of %d sentences missing; asking again", batch.page + 1, len(missing), len(batch.sentences))
-        retry = engine.translate(batch_prompt(missing, context=title), cancel=cancel)
+        try:
+            retry = engine.translate(batch_prompt(missing, context=title), cancel=cancel)
+        except EnginePromptRejected:
+            more, refused = _split(Batch(batch.page, tuple(missing)), engine, title, cancel)
+            result.update(more)
+            return result, refused
         result.update(parse_batch(retry, [s.id for s in missing]))
-    return result
+    return result, []
+
+
+def _split(
+    batch: Batch, engine: TranslationEngine, title: str, cancel: threading.Event
+) -> tuple[dict[str, str], list[str]]:
+    if len(batch.sentences) == 1:
+        log.info("Page %s: OpenAI refused sentence %s; leaving it in English", batch.page + 1, batch.ids[0])
+        return {}, batch.ids
+    middle = len(batch.sentences) // 2
+    result: dict[str, str] = {}
+    refused: list[str] = []
+    for part in (batch.sentences[:middle], batch.sentences[middle:]):
+        if cancel.is_set():
+            break
+        done, out = _run_batch(Batch(batch.page, part), engine, title, cancel)
+        result.update(done)
+        refused += out
+    return result, refused
 
 
 def translate_paper(
@@ -150,8 +182,9 @@ def translate_paper(
 
     model = getattr(engine, "model", "") or ""
     failures: list[str] = []
+    refused = 0
     queue = list(batches)
-    running: dict[Future[dict[str, str]], Batch] = {}
+    running: dict[Future[tuple[dict[str, str], list[str]]], Batch] = {}
 
     with ThreadPoolExecutor(max_workers=max(1, parallel), thread_name_prefix="translate") as pool:
         try:
@@ -165,7 +198,7 @@ def translate_paper(
                 for future in finished:
                     batch = running.pop(future)
                     try:
-                        result = future.result()
+                        result, turned_down = future.result()
                     except (TranslationCancelled, EngineAuthError, EngineRateLimited):
                         raise
                     except TranslationError as exc:
@@ -174,6 +207,9 @@ def translate_paper(
                         continue
                     if result:
                         store.update(result, engine=engine.key, model=model)
+                    if turned_down:
+                        store.refuse(turned_down)
+                        refused += len(turned_down)
                     done += len(result)
                     on_progress(
                         Progress(done, total, page=batch.page, message=f"{batch.page + 1}쪽 번역됨")
@@ -184,7 +220,10 @@ def translate_paper(
             cancel.set()  # stop the batches still running before re-raising
             raise
 
-    message = "번역 완료" if done >= total else f"{total - done}문장이 번역되지 않았습니다. 다시 실행하면 이어서 번역합니다."
-    if failures and done == 0:
+    left = total - done - refused
+    message = "번역 완료" if left <= 0 else f"{left}문장이 번역되지 않았습니다. 다시 실행하면 이어서 번역합니다."
+    if refused:
+        message += f" ({refused}문장은 OpenAI가 번역을 거절해 원문으로 둡니다)"
+    if failures and done == 0 and not refused:
         raise TranslationError(failures[0])
     return Progress(done, total, message=message)
