@@ -7,11 +7,17 @@ than read as garbage.
 
 from __future__ import annotations
 
+import re
+from collections import Counter
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pymupdf
 
-__all__ = ["MATERIAL_SUFFIXES", "MaterialError", "read_pages", "read_paper"]
+if TYPE_CHECKING:
+    from ..core.models import PaperLayout
+
+__all__ = ["MATERIAL_SUFFIXES", "STRAY_MIN_SIZE", "MaterialError", "read_pages", "read_paper", "stray_lines"]
 
 #: Text formats a transcript or a quiz may come in, besides PDF.
 TEXT_SUFFIXES = (".txt", ".md", ".markdown", ".srt", ".vtt")
@@ -65,3 +71,42 @@ def read_paper(root: Path) -> tuple[str, str]:
         pages = read_pages(project.pdf_path)
     text = "\n\n".join(f"[p.{n}]\n{page.strip()}" for n, page in enumerate(pages, start=1) if page.strip())
     return project.title, text
+
+
+#: Print smaller than this is a plot's ticks and labels, not something to read.
+STRAY_MIN_SIZE = 6.0
+_TOKEN = re.compile(r"[A-Za-z0-9가-힣]+")
+_SPACE = re.compile(r"\s+")
+
+
+def stray_lines(path: Path, layout: PaperLayout, *, min_size: float = STRAY_MIN_SIZE) -> dict[int, list[str]]:
+    """The lines of each page that no paragraph of ``layout`` holds.
+
+    The layout leaves out what it cannot place: a slide's text box it did not
+    read as a paragraph, a formula set in pieces, a plot's ticks. A review of
+    a lecture needs the first two. Returns, by page (from 0), each line whose
+    words are mostly in none of the page's blocks, in reading order, leaving
+    out print under ``min_size`` points.
+    """
+    found: dict[int, list[str]] = {}
+    with pymupdf.open(path) as document:
+        for page, layout_page in zip(document, layout.pages):
+            text_of_blocks = " ".join(block.text for block in layout_page.blocks)
+            held = Counter(_TOKEN.findall(text_of_blocks))
+            # Korean is often stored without its spaces: "정형데이터와비정형데이터".
+            compact = _SPACE.sub("", text_of_blocks)
+            lines = []
+            for item in page.get_text("dict", sort=True)["blocks"]:
+                for line in item.get("lines", []):
+                    spans = line.get("spans") or []
+                    text = " ".join("".join(span["text"] for span in spans).split())
+                    words = _TOKEN.findall(text)
+                    if not words or max(span["size"] for span in spans) < min_size:
+                        continue
+                    if _SPACE.sub("", text) in compact:
+                        continue
+                    if sum(1 for word in words if held[word]) * 2 < len(words):
+                        lines.append(text)
+            if lines:
+                found[layout_page.number] = lines
+    return found

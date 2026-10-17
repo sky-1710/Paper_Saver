@@ -9,11 +9,16 @@ Capture (Ctrl+Shift+X, ⌘⇧X on a Mac) turns the next drag on either pane into
 the region is rendered sharp and can be asked about in the GPT tab, pasted
 into the note, or copied. When GPT's answer cites sentences of the page, the
 reader scrolls to them and they stay lit until the next click on a page.
+
+The right pane can show, instead of the translation, a one-page review of the
+paper or Cornell notes on it (§4d); a part of either, clicked, lights the
+sentences it rests on in the original the same way.
 """
 
 from __future__ import annotations
 
 import copy
+import logging
 import re
 import sys
 from collections.abc import Callable
@@ -32,15 +37,19 @@ from PySide6.QtGui import (
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QFileDialog,
     QFrame,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
     QMenu,
     QMessageBox,
     QScrollArea,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -53,17 +62,21 @@ from ..core.geometry import Rect
 from ..core.lecture import (
     SlideDeck,
     align_transcript,
+    combine_transcripts,
     extract_quiz_examples,
     format_quiz_examples,
     parse_transcript,
+    transcript_by_page,
     transcript_excerpt,
 )
 from ..core.notebook import IMAGE_SUFFIXES
 from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
 from ..core.project import HIGHLIGHT_COLORS, Project, WordEntry
 from ..core.quiz import QuizStore, id_prefix
+from ..core.review import KINDS as REVIEW_KINDS
+from ..core.review import ReviewStore, paper_text, plain_citations, refs_in
 from ..pdf.document import PaperDocument
-from ..pdf.text import MaterialError, read_pages, read_paper
+from ..pdf.text import MaterialError, read_pages, read_paper, stray_lines
 from ..render.quiz_pdf import PLACEMENTS, quiz_pdf, slides_quiz_pdf
 from ..translate.codex_cli import forget_codex_session
 from ..translate.dictionary import Dictionary, clean_word
@@ -82,6 +95,7 @@ from ..translate.prompts import (
     sentence_tag,
 )
 from ..translate.quiz import CodexQuizGenerator, QuizGenerationInput
+from ..translate.review import CodexReviewGenerator, ReviewRequest
 from .bookmarks_panel import BookmarksPanel
 from .chat_panel import ChatPanel
 from .dictionary_panel import DictionaryPanel
@@ -91,11 +105,14 @@ from .note_panel import NotePanel
 from .notes_panel import NotesPanel
 from .page_canvas import MARGIN, MarginNote, PageCanvas, RangeMark
 from .quiz_panel import QuizPanel
+from .review_panel import ReviewPanel
 from .session import PaperSession
 from .wordbook_panel import WordbookPanel
 from .workers import BackgroundTask
 
 __all__ = ["ReaderView"]
+
+log = logging.getLogger(__name__)
 
 
 NOTE_KEY = "Ctrl+Shift+M" if sys.platform == "darwin" else "Ctrl+M"
@@ -122,20 +139,41 @@ class _Scroll(QScrollArea):
         super().wheelEvent(event)
 
 
-def _pane(title: str, canvas: PageCanvas) -> tuple[QWidget, _Scroll]:
+#: The bar above each pane: one height for both, so their pages line up (§1.3).
+PANE_HEADER_HEIGHT = 28
+#: What the right pane can show, and the label of each.
+RIGHT_MODES = {"translation": "번역 (직역)", **REVIEW_KINDS}
+
+
+def _scroll(canvas: PageCanvas) -> _Scroll:
     scroll = _Scroll()
     scroll.setWidget(canvas)
     scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
-    label = QLabel(title)
-    label.setObjectName("paneTitle")
+    return scroll
+
+
+def _header(*widgets: QWidget) -> QFrame:
+    bar = QFrame()
+    bar.setObjectName("paneHeader")
+    bar.setFixedHeight(PANE_HEADER_HEIGHT)
+    layout = QHBoxLayout(bar)
+    layout.setContentsMargins(6, 0, 6, 0)
+    layout.setSpacing(2)
+    for widget in widgets:
+        layout.addWidget(widget)
+    layout.addStretch(1)
+    return bar
+
+
+def _pane(header: QWidget, body: QWidget) -> QWidget:
     box = QWidget()
     layout = QVBoxLayout(box)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(0)
-    layout.addWidget(label)
-    layout.addWidget(scroll, 1)
-    return box, scroll
+    layout.addWidget(header)
+    layout.addWidget(body, 1)
+    return box
 
 
 class _SideTabs(QTabWidget):
@@ -210,8 +248,8 @@ class ReaderView(QWidget):
         project = session.project
         self.left = PageCanvas(session, translated=False)
         self.right = PageCanvas(session, translated=True)
-        left_box, self.left_scroll = _pane("원문", self.left)
-        right_box, self.right_scroll = _pane("번역 (직역)", self.right)
+        self.left_scroll = _scroll(self.left)
+        self.right_scroll = _scroll(self.right)
 
         order = {s.id: i for i, (_, _, s) in enumerate(session.layout.sentences())}
         self.dictionary_panel = DictionaryPanel()
@@ -238,6 +276,12 @@ class ReaderView(QWidget):
         self._quiz_task: BackgroundTask | None = None
         self._material_task: BackgroundTask | None = None
         self._quiz_pdf_task: BackgroundTask | None = None
+        self.review_store = ReviewStore(project.root)
+        self.review_store.bind(session.layout)
+        self.review_panel = ReviewPanel(
+            self.review_store, transcripts=lambda: [(m.name, m.file) for m in self.quiz_store.transcripts]
+        )
+        self._review_tasks: dict[str, BackgroundTask] = {}
         self.side = _SideTabs()
         self.side.addTab(self.dictionary_panel, "사전")
         self.side.addTab(self.chat_panel, "GPT")
@@ -246,6 +290,25 @@ class ReaderView(QWidget):
         self.side.addTab(self.bookmarks_panel, "북마크")
         self.side.addTab(self.wordbook_panel, "단어장")
         self.side.setMinimumWidth(260)
+
+        title = QLabel("원문")
+        title.setObjectName("paneTitle")
+        left_box = _pane(_header(title), self.left_scroll)
+        # The right pane: the translation, or the review or Cornell notes in its place.
+        self._mode_buttons: dict[str, QToolButton] = {}
+        group = QButtonGroup(self)
+        for mode, label in RIGHT_MODES.items():
+            button = QToolButton(text=label, checkable=True)
+            button.clicked.connect(lambda _=False, m=mode: self.set_right_mode(m))
+            group.addButton(button)
+            self._mode_buttons[mode] = button
+        self._mode_buttons["translation"].setChecked(True)
+        self._mode_buttons["one_page"].setToolTip("GPT가 쓴 논문 한 장 요약. 항목을 누르면 근거 문장을 원문에서 보여 줍니다.")
+        self._mode_buttons["cornell"].setToolTip("GPT가 쓴 코넬 노트(단서 · 노트 · 요약). 항목을 누르면 근거 문장을 원문에서 보여 줍니다.")
+        self.right_stack = QStackedWidget()
+        self.right_stack.addWidget(self.right_scroll)
+        self.right_stack.addWidget(self.review_panel)
+        right_box = _pane(_header(*self._mode_buttons.values()), self.right_stack)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.addWidget(left_box)
@@ -351,9 +414,17 @@ class ReaderView(QWidget):
         self.quiz_panel.generateRequested.connect(self.generate_quiz)
         self.quiz_panel.stopRequested.connect(self.stop_quiz)
         self.quiz_panel.slideRequested.connect(self._show_slide)
-        self.quiz_panel.transcriptChosen.connect(self._register_transcript)
+        for panel in (self.quiz_panel, self.review_panel):
+            panel.transcriptsChosen.connect(self._register_transcripts)
+            panel.transcriptRemoved.connect(self._remove_transcript)
+            panel.transcriptMoved.connect(self._move_transcript)
         self.quiz_panel.stylesChosen.connect(self._register_styles)
         self.quiz_panel.pdfExportRequested.connect(self.export_quiz_pdf)
+        self.review_panel.generateRequested.connect(self.generate_review)
+        self.review_panel.stopRequested.connect(self.stop_review)
+        self.review_panel.evidenceRequested.connect(self._review_evidence)
+        self.review_panel.toNoteRequested.connect(self.review_to_note)
+        self.evidenceLit.connect(lambda count: count or self.review_panel.clear_active())
         self.side.currentChanged.connect(lambda _i: self.side.currentWidget() is self.quiz_panel and self._load_deck())
         # Translations arrive after a sentence is marked; shown, the list is current.
         self.side.currentChanged.connect(
@@ -692,6 +763,11 @@ class ReaderView(QWidget):
         menu.addAction("메모 추가…", lambda: self.add_note(sentence_id))
         menu.addAction(f"GPT 입력창에 넣기\t{_MOD}G", lambda: self.quote_to_gpt(sentence_id))
         menu.addAction("GPT에게 이 문장 설명 요청", lambda: self.quote_to_gpt(sentence_id, ask=True))
+        if self.review_panel.editing:
+            menu.addAction(
+                f"{REVIEW_KINDS[self.review_panel.kind]}에 근거 링크 넣기",
+                lambda: self.review_panel.insert_citation(sentence_id, ref.page),
+            )
         pens = menu.addMenu("형광펜")
         current = self.session.project.highlights.color_of(sentence_id)
         for name, color in HIGHLIGHT_COLORS.items():
@@ -1324,7 +1400,7 @@ class ReaderView(QWidget):
             return
         project, store = self.session.project, self.quiz_store
         pdf, deck = project.pdf_path, self._deck
-        transcript, styles = store.transcript_text(), store.style_text()
+        transcripts, styles = store.transcript_parts(), store.style_text()
         image_path = store.root / QuizStore.FOLDER / "slides" / f"slide-{slide}.png" if store.send_slide_image else None
         prefix, lecture = id_prefix(project.title), project.title
 
@@ -1333,8 +1409,8 @@ class ReaderView(QWidget):
             page = slide - 1
             content = slides.content(page)
             excerpt = section = ""
-            if transcript.strip():
-                sections = parse_transcript(transcript)
+            if transcripts:
+                sections = combine_transcripts([parse_transcript(text) for _, text in transcripts])
                 excerpt, section = transcript_excerpt(sections, align_transcript(slides.pages, sections).get(page, []))
             if not content.strip() and not excerpt.strip() and image_path is None:
                 raise TranslationError(
@@ -1425,28 +1501,52 @@ class ReaderView(QWidget):
             return True
         return False
 
-    def _register_transcript(self, path: str) -> None:
-        """Read the STT off the UI thread, copy it in, and say what was found."""
+    def _register_transcripts(self, paths: list) -> None:
+        """Read STT files off the UI thread, copy them in, and say what was
+        found. They join the list after the ones there, in the order picked."""
         if self._material_running():
+            self.statusMessage.emit("앞의 자료를 읽는 중입니다. 잠시 후 다시 시도하세요.")
             return
-        store, source = self.quiz_store, Path(path)
+        store, sources = self.quiz_store, [Path(p) for p in paths]
 
         def work(_cancel, _report):  # type: ignore[no-untyped-def]
-            text = "\n".join(read_pages(source))
-            if not text.strip():
-                raise MaterialError(f"'{source.name}'에서 텍스트를 찾지 못했습니다. (스캔한 PDF라면 텍스트 PDF나 txt로 바꿔 주세요)")
-            sections = parse_transcript(text)
-            return store.import_material(source, text), sections
+            added = []
+            for source in sources:
+                text = "\n".join(read_pages(source))
+                if not text.strip():
+                    raise MaterialError(
+                        f"'{source.name}'에서 텍스트를 찾지 못했습니다. (스캔한 PDF라면 텍스트 PDF나 txt로 바꿔 주세요)"
+                    )
+                added.append((store.import_material(source, text), parse_transcript(text)))
+            return added
 
-        def finished(result) -> None:  # type: ignore[no-untyped-def]
-            material, sections = result
-            store.set_transcript(material)
-            slides = sum(1 for s in sections if s.number is not None)
-            found = f"슬라이드 표시 {slides}개 구간" if slides else f"{len(sections)}개 구간 (슬라이드 표시 없음 · 내용으로 연결)"
+        def finished(added) -> None:  # type: ignore[no-untyped-def]
+            found = []
+            for material, sections in added:
+                store.add_transcript(material)
+                slides = sum(1 for s in sections if s.number is not None)
+                found.append(f"{material.name} — " + (
+                    f"슬라이드 표시 {slides}개 구간" if slides else f"{len(sections)}개 구간 (슬라이드 표시 없음 · 내용으로 연결)"
+                ))
             if not self._closed:
-                self.quiz_panel.set_material_busy(False, f"STT 등록: {material.name} — {found}")
+                message = "STT 등록: " + " / ".join(found)
+                self.quiz_panel.set_material_busy(False, message)
+                self.review_panel.refresh()
+                self.statusMessage.emit(message)
 
-        self._run_material(work, finished, "STT를 읽는 중…")
+        self._run_material(work, finished, f"STT {len(sources)}개를 읽는 중…")
+
+    def _remove_transcript(self, file: str) -> None:
+        self.quiz_store.remove_transcript(file)
+        self._transcripts_changed()
+
+    def _move_transcript(self, file: str, step: int) -> None:
+        self.quiz_store.move_transcript(file, step)
+        self._transcripts_changed()
+
+    def _transcripts_changed(self) -> None:
+        self.quiz_panel.refresh_materials()
+        self.review_panel.refresh()
 
     def _register_styles(self, paths: list) -> None:
         if self._material_running():
@@ -1477,13 +1577,143 @@ class ReaderView(QWidget):
     def _run_material(self, work, finished, message: str) -> None:  # type: ignore[no-untyped-def]
         def failed(exc: Exception) -> None:
             if not self._closed:
-                self.quiz_panel.set_material_busy(False, str(exc) if isinstance(exc, MaterialError) else f"자료를 읽지 못했습니다: {exc}")
+                text = str(exc) if isinstance(exc, MaterialError) else f"자료를 읽지 못했습니다: {exc}"
+                self.quiz_panel.set_material_busy(False, text)
+                self.statusMessage.emit(text.split("\n")[0])
 
         task = BackgroundTask(work, name="quiz-material")
         task.succeeded.connect(finished)
         task.failed.connect(failed)
         self.quiz_panel.set_material_busy(True, message)
         self._material_task = task.start()
+
+    # -- one-page review and Cornell notes (§4d) ------------------------------------------
+
+    @property
+    def right_mode(self) -> str:
+        """"translation", or the review the right pane shows in its place."""
+        return "translation" if self.right_stack.currentWidget() is self.right_scroll else self.review_panel.kind
+
+    def set_right_mode(self, mode: str) -> None:
+        if mode not in RIGHT_MODES:
+            return
+        self._mode_buttons[mode].setChecked(True)
+        if mode == "translation":
+            self.review_panel.flush()
+            self.right_stack.setCurrentWidget(self.right_scroll)
+            # Hidden, the translation kept scrolling with the original but was
+            # not laid out; line it up again once it is.
+            QTimer.singleShot(0, self, self._align_right)
+            return
+        self.review_panel.set_kind(mode)
+        self.right_stack.setCurrentWidget(self.review_panel)
+
+    def _align_right(self) -> None:
+        self._sync(self.right_scroll.verticalScrollBar(), self.left_scroll.verticalScrollBar().value())
+        self._sync(self.right_scroll.horizontalScrollBar(), self.left_scroll.horizontalScrollBar().value())
+
+    def _review_evidence(self, ids: list[str]) -> None:
+        found = [i for i in ids if self.session.sentence(i) is not None]
+        if not found:
+            self.statusMessage.emit("근거 문장을 이 논문에서 찾지 못했습니다. (링크가 가리키는 문장이 없습니다)")
+            return
+        self.show_evidence(found)
+        pages = ", ".join(dict.fromkeys(f"p.{self._page_of(i) + 1}" for i in found))
+        self.statusMessage.emit(f"근거 문장 {len(found)}개 ({pages}) — 페이지를 누르면 표시가 꺼집니다.")
+
+    def generate_review(self, kind: str) -> None:
+        """Write a one-page review or Cornell notes of the whole paper."""
+        task = self._review_tasks.get(kind)
+        if kind not in REVIEW_KINDS or (task is not None and task.running):
+            return
+        engine = self._engine_provider()
+        if engine is None:
+            self.review_panel.set_error(kind, "GPT 사용에 동의하고 Codex가 설치되어 있어야 만들 수 있습니다.")
+            return
+        layout, title, store = self.session.layout, self.session.project.title, self.review_store
+        pdf, deck = self.session.project.pdf_path, self._deck
+        transcripts = self.quiz_store.transcript_parts()
+        names = tuple(name for name, _ in transcripts)
+
+        def work(cancel, _report):  # type: ignore[no-untyped-def]
+            pages = {s.id: page.number for page, _, s in layout.sentences()}
+            try:
+                strays = stray_lines(pdf, layout)
+            except Exception:  # pymupdf raises several unrelated types
+                log.warning("Could not read the lines the layout left out", exc_info=True)
+                strays = {}
+            spoken: dict[int, str] = {}
+            if transcripts:
+                # Matched to the slides as the quiz matches them, all of it.
+                sections = combine_transcripts([parse_transcript(text) for _, text in transcripts])
+                spoken = transcript_by_page((deck or SlideDeck(read_pages(pdf))).pages, sections)
+            text, numbering = paper_text(layout, strays=strays, spoken=spoken)
+            if not numbering:
+                raise TranslationError("이 PDF에서 정리할 본문 문장을 찾지 못했습니다. (스캔한 PDF에는 글자가 없습니다)")
+            generator = CodexReviewGenerator(engine)
+            note = ""
+            try:
+                markdown = generator.generate(
+                    ReviewRequest(kind, title, text, numbering, pages, transcripts=names), cancel=cancel
+                )
+            except EnginePromptRejected:
+                # A grading prompt quoted in an appendix will do it: the paper
+                # up to its references, once more.
+                shorter, cut = paper_text(layout, strays=strays, spoken=spoken, until_references=True)
+                if not cut or len(shorter) >= len(text):
+                    raise
+                markdown = generator.generate(
+                    ReviewRequest(kind, title, shorter, cut, pages, transcripts=names), cancel=cancel
+                )
+                note = "OpenAI가 논문 전체를 거절해서(부록에 인용된 프롬프트 때문일 때가 많습니다) 참고문헌 앞까지만 보내 만들었습니다."
+            texts = {s.id: s.text for _, _, s in layout.sentences()}
+            anchors = {i: texts[i] for i in refs_in(markdown) if i in texts}
+            return markdown, anchors, note
+
+        # Kept even if the paper closed meanwhile: it was paid for.
+        def finished(result) -> None:  # type: ignore[no-untyped-def]
+            markdown, anchors, note = result
+            model = str(getattr(engine, "chat_model", "") or "")
+            store.put(
+                kind, markdown, anchors=anchors, engine=str(getattr(engine, "key", "")), model=model,
+                transcripts=list(names),
+            )
+            if not self._closed:
+                self.review_panel.set_generating(kind, False)
+                self.statusMessage.emit(note or f"{REVIEW_KINDS[kind]} 완성 — 항목을 누르면 근거 문장을 원문에서 보여 줍니다.")
+
+        def failed(exc: Exception) -> None:
+            if self._closed:
+                return
+            self.review_panel.set_generating(kind, False)
+            if isinstance(exc, TranslationCancelled):
+                self.statusMessage.emit("만들기를 멈췄습니다.")
+                return
+            text = str(exc)
+            if isinstance(exc, EnginePromptRejected):
+                text += "\n\nOpenAI가 이 논문의 본문을 거절했습니다. 부록을 뺀 본문도 거절되었습니다."
+            self.review_panel.set_error(kind, text)
+
+        task = BackgroundTask(work, name=f"review-{kind}")
+        task.succeeded.connect(finished)
+        task.failed.connect(failed)
+        self.review_panel.set_generating(kind, True)
+        self._review_tasks[kind] = task.start()
+
+    def stop_review(self, kind: str) -> None:
+        task = self._review_tasks.get(kind)
+        if task is not None and task.running:
+            task.cancel()
+
+    def review_to_note(self, kind: str) -> None:
+        """The document into the note, its citations as page numbers."""
+        self.review_panel.flush()
+        doc = self.review_store.get(kind)
+        if doc is None:
+            return
+        self.note_panel.append(plain_citations(doc.text).strip())
+        self._show_tab(self.note_panel)
+        self.statusMessage.emit(f"노트에 넣었습니다: {REVIEW_KINDS[kind]}")
 
     # -- lifetime ---------------------------------------------------------------------
 
@@ -1492,8 +1722,11 @@ class ReaderView(QWidget):
         self.cancel_capture()
         self.notes_panel.save_memo()
         self.note_panel.shutdown()
+        self.review_panel.flush()
         self.stop_gpt()
         self.stop_quiz()
+        for kind in list(self._review_tasks):
+            self.stop_review(kind)
         if self._lookup_task is not None:
             self._lookup_task.cancel()
 

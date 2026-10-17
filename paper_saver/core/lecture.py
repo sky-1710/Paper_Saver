@@ -16,7 +16,10 @@ needs before anything is sent to Codex:
     section. So sections are matched to PDF pages by the words they share,
     in lecture order (a dynamic programme that never moves backwards), and a
     "Same as Slide K" section goes wherever section K went. A transcript with
-    no slide markers at all is cut into chunks and matched the same way.
+    no slide markers at all is cut into chunks and matched the same way. A
+    lecture recorded in parts is joined into one first (``combine_transcripts``);
+    a review of the whole lecture takes all of it, page by page
+    (``transcript_by_page``).
 
 ``extract_quiz_examples``
     The professor's previous quizzes, reduced to their numbered statements,
@@ -31,16 +34,18 @@ import math
 import re
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 __all__ = [
     "SlideDeck",
     "StyleExample",
     "TranscriptSection",
     "align_transcript",
+    "combine_transcripts",
     "extract_quiz_examples",
     "format_quiz_examples",
     "parse_transcript",
+    "transcript_by_page",
     "transcript_excerpt",
 ]
 
@@ -322,6 +327,61 @@ def align_transcript(slides: Sequence[str], sections: Sequence[TranscriptSection
         if sections[index].text.strip():
             result.setdefault(placed[index], []).append(index)
     return result
+
+
+def combine_transcripts(parts: Sequence[Sequence[TranscriptSection]]) -> list[TranscriptSection]:
+    """Several recordings' sections as one lecture, in the order given.
+
+    A professor who records a lecture in parts leaves a file per part, each
+    numbering its slides from 1 again. Numbers are moved up past the parts
+    before, so a "Same as Slide 3" in the second part follows its own Slide 3,
+    and each label says which part it is from ("영상 2 · Slide 3"). A single
+    recording is returned as it is.
+    """
+    if len(parts) == 1:
+        return list(parts[0])
+    combined: list[TranscriptSection] = []
+    offset = 0
+    for index, sections in enumerate(parts, start=1):
+        highest = 0
+        for section in sections:
+            combined.append(replace(
+                section,
+                label=f"영상 {index} · {section.label}",
+                number=None if section.number is None else section.number + offset,
+                same_as=None if section.same_as is None else section.same_as + offset,
+            ))
+            highest = max(highest, section.number or 0, section.same_as or 0)
+        offset += highest
+    return combined
+
+
+#: The STT a review of the whole lecture carries, at most.
+REVIEW_TRANSCRIPT_CHARS = 200_000
+
+
+def transcript_by_page(
+    slides: Sequence[str], sections: Sequence[TranscriptSection], budget: int = REVIEW_TRANSCRIPT_CHARS
+) -> dict[int, str]:
+    """All of the STT, each part under the page it explains: ``{page index: text}``.
+
+    For a review of the whole lecture rather than one slide's quiz: every
+    section is placed somewhere, and a lecture that says more than ``budget``
+    characters has each page's share cut in proportion.
+    """
+    mapping = align_transcript(slides, sections)
+    total = sum(len(sections[i].text) for indices in mapping.values() for i in indices)
+    scale = min(1.0, budget / total) if total else 1.0
+    out: dict[int, str] = {}
+    for page, indices in mapping.items():
+        size = sum(len(sections[i].text) for i in indices)
+        # Room for each section's header ("[영상 2 · Slide 7 · 00:03:20–00:05:10]")
+        # and, when nothing is to be cut, for transcript_excerpt's slack too.
+        room = 120 if scale >= 1 else 40
+        text, _ = transcript_excerpt(sections, indices, limit=int(size * scale) + room * len(indices))
+        if text:
+            out[page] = text
+    return out
 
 
 def transcript_excerpt(

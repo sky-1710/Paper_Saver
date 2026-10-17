@@ -6,6 +6,10 @@ Everything lives in the project folder::
     <project>/quiz/materials/           the STT and the style references, copied in,
                                         each with its extracted text beside it
 
+The STT is the lecture's, not the quiz's: a professor who records a lecture in
+parts leaves several files, kept in lecture order, and the one-page review and
+Cornell notes (§4d) read the same list.
+
 A quiz is kept until the reader asks for a new one, so going back to a slide
 shows the same questions and the answers already given - Codex runs once per
 slide, not once per visit.
@@ -257,7 +261,8 @@ class QuizStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         self.path = self.root / self.FILE
-        self.transcript: Material | None = None
+        #: The lecture's STT, one file per recording, in lecture order.
+        self.transcripts: list[Material] = []
         self.styles: list[Material] = []
         #: Send the slide's picture along, so figures can be asked about.
         self.send_slide_image = False
@@ -282,8 +287,9 @@ class QuizStore:
             return
         materials = data.get("materials") or {}
         try:
-            if materials.get("transcript"):
-                self.transcript = Material(**materials["transcript"])
+            # One file before several could be registered: "transcript".
+            listed = materials.get("transcripts") or ([materials["transcript"]] if materials.get("transcript") else [])
+            self.transcripts = [Material(**m) for m in listed]
             self.styles = [Material(**m) for m in materials.get("styles") or []]
         except TypeError:
             log.warning("Quiz materials list is malformed; ignoring it")
@@ -306,7 +312,7 @@ class QuizStore:
             self.path,
             {
                 "materials": {
-                    "transcript": self.transcript.__dict__ if self.transcript else None,
+                    "transcripts": [m.__dict__ for m in self.transcripts],
                     "styles": [m.__dict__ for m in self.styles],
                 },
                 "sendSlideImage": self.send_slide_image,
@@ -329,7 +335,7 @@ class QuizStore:
         """Copy a file in and write its text beside it; the store is unchanged.
 
         Touches only new files, so a worker may do it while the reader keeps
-        answering; :meth:`set_transcript` / :meth:`add_style` then take it in.
+        answering; :meth:`add_transcript` / :meth:`add_style` then take it in.
         """
         folder = self.materials_dir
         folder.mkdir(parents=True, exist_ok=True)
@@ -355,18 +361,25 @@ class QuizStore:
             except OSError:
                 log.warning("Could not remove %s", relative, exc_info=True)
 
-    def set_transcript(self, material: Material) -> None:
-        """Register the lecture's STT, replacing any earlier one."""
-        if self.transcript is not None and self.transcript.file != material.file:
-            self._discard(self.transcript)
-        self.transcript = material
+    def add_transcript(self, material: Material) -> None:
+        """Register one recording's STT, after the ones already there."""
+        self.transcripts.append(material)
         self.save()
 
-    def clear_transcript(self) -> None:
-        if self.transcript is not None:
-            self._discard(self.transcript)
-            self.transcript = None
-            self.save()
+    def remove_transcript(self, file: str) -> None:
+        for material in [m for m in self.transcripts if m.file == file]:
+            self._discard(material)
+        self.transcripts = [m for m in self.transcripts if m.file != file]
+        self.save()
+
+    def move_transcript(self, file: str, step: int) -> None:
+        """Earlier (-1) or later (+1) in the lecture."""
+        index = next((i for i, m in enumerate(self.transcripts) if m.file == file), None)
+        if index is None or not 0 <= index + step < len(self.transcripts):
+            return
+        items = self.transcripts
+        items[index], items[index + step] = items[index + step], items[index]
+        self.save()
 
     def add_style(self, material: Material) -> None:
         """Register one of the professor's earlier quizzes, as extracted examples."""
@@ -388,8 +401,9 @@ class QuizStore:
             log.warning("Material text missing: %s", material.text)
             return ""
 
-    def transcript_text(self) -> str:
-        return self._read_text(self.transcript)
+    def transcript_parts(self) -> list[tuple[str, str]]:
+        """Each recording's STT as (file name, text), in lecture order."""
+        return [(m.name, text) for m in self.transcripts if (text := self._read_text(m)).strip()]
 
     def style_text(self) -> str:
         """Every reference's examples, each under the name of its file."""

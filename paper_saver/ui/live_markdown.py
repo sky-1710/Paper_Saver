@@ -22,6 +22,7 @@ checkbox ticks it.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QPointF, QRectF, Qt, QTimer, QUrl, Signal
@@ -315,6 +316,9 @@ class LiveMarkdownEdit(QTextEdit):
         self.document().setDocumentMargin(10)
         #: Where relative image links are resolved from; no pictures if None.
         self.base_dir: Path | None = None
+        #: Given a link's target first on Ctrl+click; True means it was handled
+        #: (a review's ``ref:`` link shows its sentences instead of opening).
+        self.link_handler: Callable[[str], bool] | None = None
         #: First and last block number of what is being edited - the line,
         #: or the table or ``$$`` block the cursor is in - whose source shows.
         self.active = (-1, -1)
@@ -786,6 +790,8 @@ class LiveMarkdownEdit(QTextEdit):
         for span in line.spans:
             if span.role == "link" and span.start <= at <= span.end and span.start in line.links:
                 target = line.links[span.start]
+                if self.link_handler is not None and self.link_handler(target):
+                    return True
                 url = QUrl(target)
                 if url.isRelative() and self.base_dir is not None:
                     url = QUrl.fromLocalFile(str(self.base_dir / target))

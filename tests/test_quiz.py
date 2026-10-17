@@ -134,11 +134,11 @@ def test_store_keeps_materials_quizzes_and_answers(tmp_path: Path) -> None:
     source.write_text("## Slide 1\nhello", encoding="utf-8")
     root = tmp_path / "project"
     store = QuizStore(root)
-    store.set_transcript(store.import_material(source, "hello"))
+    store.add_transcript(store.import_material(source, "hello"))
     store.add_style(store.import_material(source, "- style (O)"))
-    assert store.transcript_text() == "hello"
+    assert store.transcript_parts() == [("OS06 lecture.md", "hello")]
     assert "# OS06 lecture.md\n- style (O)" in store.style_text()
-    assert store.styles[0].file != store.transcript.file  # a second copy, not an overwrite
+    assert store.styles[0].file != store.transcripts[0].file  # a second copy, not an overwrite
 
     quiz = slide_quiz_from_dict(_quiz_dict(), slide=2, id_prefix="os06-")
     store.put(quiz)
@@ -153,7 +153,7 @@ def test_store_keeps_materials_quizzes_and_answers(tmp_path: Path) -> None:
     assert again.get(2).questions[0].id == "os06-slide2-easy"
     assert again.attempt(2).answers == {easy.id: True, medium.id: True}
     assert again.attempt(2).hints == [medium.id]
-    assert again.transcript.name == "OS06 lecture.md"
+    assert again.transcripts[0].name == "OS06 lecture.md"
 
     exported = tmp_path / "quiz.json"
     assert again.export(exported, "OS06") == 1
@@ -161,9 +161,27 @@ def test_store_keeps_materials_quizzes_and_answers(tmp_path: Path) -> None:
     assert other.import_file(exported) == 1
     assert other.get(2).questions[2].question.startswith("If base is 16KB")
 
-    old = again.transcript.file
-    again.clear_transcript()
-    assert not (root / old).exists() and again.transcript is None
+    # A lecture recorded in parts: several files, kept in lecture order.
+    second = tmp_path / "in" / "OS06 part 2.md"
+    second.write_text("## Slide 1\nworld", encoding="utf-8")
+    again.add_transcript(again.import_material(second, "world"))
+    first = again.transcripts[0].file
+    again.move_transcript(again.transcripts[1].file, -1)
+    assert [name for name, _ in QuizStore(root).transcript_parts()] == ["OS06 part 2.md", "OS06 lecture.md"]
+    again.remove_transcript(first)
+    assert not (root / first).exists() and [m.name for m in again.transcripts] == ["OS06 part 2.md"]
+
+
+def test_a_quiz_file_with_one_transcript_still_loads(tmp_path: Path) -> None:
+    from paper_saver.core.quiz import QuizStore
+
+    material = {"name": "stt.md", "file": "quiz/materials/stt.md", "text": "quiz/materials/stt.md.txt", "added": ""}
+    (tmp_path / "quiz.json").write_text(json.dumps({"materials": {"transcript": material, "styles": []}}), "utf-8")
+    store = QuizStore(tmp_path)
+    assert [m.name for m in store.transcripts] == ["stt.md"]
+    store.save()
+    saved = json.loads((tmp_path / "quiz.json").read_text("utf-8"))
+    assert saved["materials"]["transcripts"][0]["name"] == "stt.md"
 
 
 def test_import_is_all_or_nothing(tmp_path: Path) -> None:
@@ -253,6 +271,28 @@ def test_transcript_sections_are_parsed_and_matched_to_slides() -> None:
     text, label = transcript_excerpt(sections, mapping[1])
     assert "[Slide 2 · 00:00:16–00:03:41]" in text and "again the address space" in text
     assert label.startswith("Slide 2 (00:00:16–00:03:41), Slide 5")
+
+
+def test_a_lecture_recorded_in_parts_is_one_lecture() -> None:
+    from paper_saver.core.lecture import combine_transcripts, parse_transcript, transcript_by_page
+
+    first = parse_transcript(
+        "## Slide 1\nmemory is the topic today\n## Slide 2\n" + "every process has a private address space virtual view " * 8
+    )
+    second = parse_transcript(
+        "## Slide 1\n" + "stack memory is allocated implicitly by the compiler " * 8 + "\n"
+        "## Slide 2 · Same as Slide 1\nheap memory with malloc and free"
+    )
+    sections = combine_transcripts([first, second])
+    assert [s.label for s in sections] == ["영상 1 · Slide 1", "영상 1 · Slide 2", "영상 2 · Slide 1", "영상 2 · Slide 2"]
+    assert sections[3].same_as == sections[2].number == 3  # its own Slide 1, not the first part's
+    assert combine_transcripts([first]) == first
+
+    by_page = transcript_by_page(SLIDES, sections)
+    assert "private address space" in by_page[1]
+    assert "[영상 2 · Slide 1]" in by_page[2] and "malloc" in by_page[2]
+    cut = transcript_by_page(SLIDES, sections, budget=400)
+    assert sum(map(len, cut.values())) < sum(map(len, by_page.values()))
 
 
 def test_transcript_without_markers_is_chunked_and_still_matched() -> None:
@@ -353,8 +393,8 @@ def test_reader_generates_a_quiz_for_the_slide_in_view(qapp, tmp_path: Path, two
 
     transcript = tmp_path / "stt.md"
     transcript.write_text("## Slide 1\n**[00:00:01]** graph neural networks and the SEED dataset accuracy", encoding="utf-8")
-    reader._register_transcript(str(transcript))
-    _wait(qapp, lambda: reader.quiz_store.transcript is not None)
+    reader._register_transcripts([str(transcript)])
+    _wait(qapp, lambda: bool(reader.quiz_store.transcripts))
     assert "STT 등록" in reader.quiz_panel.materials_status.text()
 
     reader.side.setCurrentWidget(reader.quiz_panel)

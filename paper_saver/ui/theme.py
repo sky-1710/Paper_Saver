@@ -6,7 +6,12 @@ QToolBar { background: #f6f7f9; border: none; border-bottom: 1px solid #dfe2e6; 
 QToolBar QToolButton { padding: 4px 9px; border-radius: 5px; }
 QToolBar QToolButton:hover { background: #e7eaee; }
 QToolBar QToolButton:checked { background: #dbe7fb; }
-QLabel#paneTitle { background: #3c4046; color: #e8eaed; padding: 4px 10px; font-weight: 600; }
+QFrame#paneHeader { background: #3c4046; }
+QLabel#paneTitle { color: #e8eaed; padding: 0 4px; font-weight: 600; }
+QFrame#paneHeader QToolButton { color: #bdc1c6; background: transparent; border: none; border-radius: 4px; padding: 2px 9px; font-weight: 600; }
+QFrame#paneHeader QToolButton:hover { color: #ffffff; background: #4a4f56; }
+QFrame#paneHeader QToolButton:checked { color: #ffffff; background: #5f6368; }
+QLabel#reviewLead { font-size: 10.5pt; color: #3c4043; }
 QLabel#sectionTitle { font-weight: 600; color: #333; padding: 2px 0; }
 QLabel#muted { color: #888; font-size: 9pt; }
 QFrame#pairBar { background: #fbfaf5; border-top: 1px solid #e3e0d4; }

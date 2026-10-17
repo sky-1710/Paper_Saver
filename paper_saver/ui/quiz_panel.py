@@ -82,8 +82,12 @@ class QuizPanel(QWidget):
     stopRequested = Signal()
     #: Show this slide (from 1) in the reader.
     slideRequested = Signal(int)
-    #: A transcript file was picked; the reader view reads and registers it.
-    transcriptChosen = Signal(str)
+    #: Transcript files were picked; the reader view reads and registers them.
+    transcriptsChosen = Signal(list)
+    #: Take this transcript off (its file, relative to the project).
+    transcriptRemoved = Signal(str)
+    #: Move this transcript earlier (-1) or later (+1) in the lecture.
+    transcriptMoved = Signal(str, int)
     #: Style reference files were picked.
     stylesChosen = Signal(list)
     #: Every quiz, in one PDF at this path, laid out as "quiz" (questions
@@ -185,18 +189,31 @@ class QuizPanel(QWidget):
         body.addWidget(_label("① Lecture Slides", "materialKind"))
         body.addWidget(_label(f"지금 열려 있는 PDF · {slides_name} ({self.slide_count}장) — 각 쪽이 한 슬라이드입니다.", "muted"))
 
-        body.addWidget(_label("② Lecture Transcript (STT) · 선택", "materialKind"))
+        body.addWidget(_label("② Lecture Transcript (STT) · 선택 · 여러 개 가능", "materialKind"))
+        self.stt_list = QListWidget()
+        self.stt_list.setMaximumHeight(78)
+        self.stt_none = _label("없음")
+        body.addWidget(self.stt_list)
+        body.addWidget(self.stt_none)
         stt_row = QHBoxLayout()
-        self.stt_name = _label("")
-        self.stt_button = QPushButton()
-        self.stt_button.clicked.connect(self._choose_transcript)
+        self.stt_button = QPushButton("추가…")
+        self.stt_button.clicked.connect(self._choose_transcripts)
+        self.stt_up = QToolButton(text="▲")
+        self.stt_up.setToolTip("강의에서 앞쪽으로")
+        self.stt_up.clicked.connect(lambda: self._move_transcript(-1))
+        self.stt_down = QToolButton(text="▼")
+        self.stt_down.setToolTip("강의에서 뒤쪽으로")
+        self.stt_down.clicked.connect(lambda: self._move_transcript(1))
         self.stt_remove = QPushButton("제거")
         self.stt_remove.clicked.connect(self._remove_transcript)
-        stt_row.addWidget(self.stt_name, 1)
-        stt_row.addWidget(self.stt_button)
-        stt_row.addWidget(self.stt_remove)
+        for widget in (self.stt_button, self.stt_up, self.stt_down, self.stt_remove):
+            stt_row.addWidget(widget)
+        stt_row.addStretch(1)
         body.addLayout(stt_row)
-        body.addWidget(_label("PDF·txt·md·srt·vtt. 있으면 각 슬라이드를 설명한 부분을 찾아 문제에 함께 씁니다.", "muted"))
+        body.addWidget(_label(
+            "PDF·txt·md·srt·vtt. 있으면 각 슬라이드를 설명한 부분을 찾아 문제에 함께 씁니다. 나눠 찍은 영상은 "
+            "강의 순서대로 두세요. 한 장 요약·코넬 노트도 이 STT를 함께 씁니다.", "muted",
+        ))
 
         body.addWidget(_label("③ Professor Quiz Style References", "materialKind"))
         self.style_list = QListWidget()
@@ -229,7 +246,7 @@ class QuizPanel(QWidget):
         )
         outer.addWidget(self._materials_body)
         # Open until there is something registered; afterwards it keeps out of the way.
-        self.materials_toggle.setChecked(self.store.transcript is None and not self.store.styles)
+        self.materials_toggle.setChecked(not self.store.transcripts and not self.store.styles)
         self._show_materials(self.materials_toggle.isChecked())
         return frame
 
@@ -239,14 +256,23 @@ class QuizPanel(QWidget):
 
     def refresh_materials(self) -> None:
         store = self.store
-        if store.transcript is not None:
-            self.stt_name.setText(store.transcript.name)
-            self.stt_button.setText("교체…")
-        else:
-            self.stt_name.setText("없음")
-            self.stt_button.setText("STT 등록…")
-        self.stt_remove.setEnabled(store.transcript is not None and not self._material_busy)
-        self.stt_button.setEnabled(not self._material_busy)
+        current = self.stt_list.currentItem()
+        selected = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
+        self.stt_list.clear()
+        for number, material in enumerate(store.transcripts, start=1):
+            item = QListWidgetItem(f"{number}. {material.name}")
+            item.setData(Qt.ItemDataRole.UserRole, material.file)
+            self.stt_list.addItem(item)
+            if material.file == selected:
+                self.stt_list.setCurrentItem(item)
+        heard = bool(store.transcripts)
+        self.stt_list.setVisible(heard)
+        self.stt_none.setVisible(not heard)
+        idle = not self._material_busy
+        self.stt_button.setEnabled(idle)
+        self.stt_remove.setEnabled(heard and idle)
+        self.stt_up.setEnabled(len(store.transcripts) > 1 and idle)
+        self.stt_down.setEnabled(len(store.transcripts) > 1 and idle)
         self.style_list.clear()
         for material in store.styles:
             item = QListWidgetItem(material.name)
@@ -255,7 +281,7 @@ class QuizPanel(QWidget):
         self.style_remove.setEnabled(bool(store.styles))
         self.style_list.setVisible(bool(store.styles))
         self.style_none.setVisible(not store.styles)
-        summary = [f"STT: {store.transcript.name}" if store.transcript else "STT 없음"]
+        summary = [f"STT {len(store.transcripts)}개" if store.transcripts else "STT 없음"]
         summary.append(f"스타일 참고 {len(store.styles)}개")
         self.materials_summary.setText(" · ".join(summary))
 
@@ -267,18 +293,33 @@ class QuizPanel(QWidget):
     def _start_dir(self) -> str:
         return str(Path.home() / "Downloads")
 
-    def _choose_transcript(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "강의 STT 파일 선택", self._start_dir(), _FILTER)
-        if path:
-            self.transcriptChosen.emit(path)
+    def _choose_transcripts(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "강의 STT 파일 선택 (여러 개 가능)", self._start_dir(), _FILTER)
+        if paths:
+            self.transcriptsChosen.emit(list(paths))
+
+    def _chosen_transcript(self) -> str | None:
+        item = self.stt_list.currentItem() or (self.stt_list.item(0) if self.stt_list.count() == 1 else None)
+        if item is None:
+            self.materials_status.setText("STT를 목록에서 고르세요.")
+            return None
+        return str(item.data(Qt.ItemDataRole.UserRole))
+
+    def _move_transcript(self, step: int) -> None:
+        file = self._chosen_transcript()
+        if file is not None:
+            self.transcriptMoved.emit(file, step)
 
     def _remove_transcript(self) -> None:
-        if self.store.transcript is None:
+        file = self._chosen_transcript()
+        material = next((m for m in self.store.transcripts if m.file == file), None)
+        if material is None:
             return
-        answer = QMessageBox.question(self, "STT 제거", f"'{self.store.transcript.name}'을(를) 퀴즈 자료에서 뺄까요?")
+        answer = QMessageBox.question(
+            self, "STT 제거", f"'{material.name}'을(를) 강의 자료에서 뺄까요? (퀴즈와 한 장 요약·코넬 노트 모두)"
+        )
         if answer == QMessageBox.StandardButton.Yes:
-            self.store.clear_transcript()
-            self.refresh_materials()
+            self.transcriptRemoved.emit(material.file)
 
     def _choose_styles(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "교수님 이전 퀴즈 선택", self._start_dir(), _FILTER)
@@ -405,7 +446,7 @@ class QuizPanel(QWidget):
         button = self._button("Generate Quiz", self._request, primary=True)
         button.setEnabled(not busy)
         self._add(self._row(button))
-        if self.store.transcript is None:
+        if not self.store.transcripts:
             self._add(_label("STT를 등록하지 않았습니다. 슬라이드만으로 문제를 만듭니다.", "muted"))
 
     def _draw_generating(self) -> None:

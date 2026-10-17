@@ -156,6 +156,10 @@ condition judged, a small calculation or scenario).
 open PDF, never uploaded separately), the lecture's STT (optional; PDF, txt,
 md, srt, vtt), and the professor's earlier quizzes, used for *style only*.
 Registered files are copied into `quiz/materials/` with their text beside them.
+The STT may be several files - a lecture recorded in parts - kept in lecture
+order and joined into one lecture, each file's "Slide N" numbers moved past
+the files before it; the one-page review and Cornell notes (§4d) use the same
+list.
 
 §4c.3 Only one slide's context is sent: its text, the STT sections matched to
 it, and the extracted style examples. STT sections are matched to pages by
@@ -170,16 +174,44 @@ reader presses Regenerate.
 
 ---
 
+## 4d. ONE-PAGE REVIEW AND CORNELL NOTES
+
+§4d.1 The right pane's header switches it between the translation and two
+documents GPT writes about the whole paper, on the reader's press: a one-page
+review (a one-line summary, then 문제와 동기 · 핵심 아이디어 · 방법 · 실험과
+결과 · 기여 · 한계와 의문 · 기억할 점) and Cornell notes (cue | notes rows in
+reading order, a summary beneath). The PDF stays on the left.
+
+§4d.2 Every point rests on the paper. GPT sees all of its text - a lecture's
+tables, diagrams and code are its content - with each sentence tagged `[S12]`,
+and answers JSON held to a schema, each point naming its sentences; numbers
+the paper did not have are dropped, and an answer in which most points cite
+nothing is sent back once with the reason. Clicking a point, a cue, a summary
+sentence or a heading lights its sentences in the PDF and scrolls there.
+With the lecture's STT registered (§4c.2), all of it goes, each part under the
+page it was matched to; a point taken from the lecture alone starts "(강의)"
+and cites that page.
+
+§4d.3 A document is Markdown the reader may edit, in the note's editor, saved
+as it is typed into `review.json`. Its citations are `[p.3](ref:<sentence
+ids>)` links: Ctrl+click follows one while editing, and a sentence's menu puts
+a new one at the cursor. The text of each cited sentence is kept beside the
+documents, so a link follows its sentence when the layout is re-extracted. A
+document is kept until the reader presses 다시 만들기, and can go into the note
+with its citations as page numbers.
+
+---
+
 ## 5. TRANSLATION ENGINE
 
 §5.1 Translation goes through the Codex CLI, signed in with the user's ChatGPT
 account: no API key, no per-token bill. `codex exec` is run non-interactively
 with the prompt on stdin and the answer written to a file. Two models can be
-set: one for translation and dictionary look-ups, one for GPT questions and
-quizzes. Unless the reader picks otherwise they are gpt-6-luna (low effort -
-many small sentence-level runs, measured to translate as well as at medium)
-and gpt-6.1-sol (low for questions, medium for quizzes, whose answer key must
-be right). A model Codex no longer offers falls back to Codex's default.
+set: one for translation and dictionary look-ups, one for GPT questions,
+quizzes and reviews. Unless the reader picks otherwise they are gpt-6-luna
+(low effort - many small sentence-level runs, measured to translate as well
+as at medium) and gpt-6.1-sol (low for questions; medium for quizzes, whose
+answer key must be right, and for reviews of the whole paper). A model Codex no longer offers falls back to Codex's default.
 
 §5.2 The engine is one class behind an interface, exactly as in Lecture Saver,
 so an OpenAI-API engine or a local model is an added file rather than a change.
@@ -189,9 +221,12 @@ before the first run. The only other thing that goes is a capture the reader
 explicitly attached to a question (`codex exec --image`), the text of a file
 the reader explicitly attached to the conversation (§4b.3), and, for a quiz, the
 slide's text, its matched STT excerpt and the style examples — plus the
-slide's picture only if the reader turned that on. The PDF itself and the
-reader's notes never go to OpenAI; a note goes to Notion only on export.
-Translation and dictionary runs leave nothing on disk (`--ephemeral`); the
+slide's picture only if the reader turned that on. A review or Cornell notes
+(§4d) sends all of the paper's text again - figure, table and code text
+included, and lines the layout could not place read from the page - without
+its reference list and page numbers, and the registered lecture STT with it. The PDF itself and the reader's notes never go to OpenAI;
+a note goes to Notion only on export. Translation, dictionary, quiz and
+review runs leave nothing on disk (`--ephemeral`); the
 session file Codex keeps for a GPT conversation is deleted when the reader
 starts a new conversation or takes off a file it was sent.
 
@@ -225,6 +260,8 @@ the whole paper.
         chat_files/         files attached to the conversation, with their text
         quiz.json           slide quizzes, answers, the list of quiz materials
         quiz/materials/     the STT and style references, copied in, with their text
+        review.json         the one-page review and Cornell notes, as Markdown,
+                            and the text of each sentence they cite
         note.md, assets/    the Markdown note, until the reader moves it
         exports/
 
