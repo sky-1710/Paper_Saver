@@ -21,7 +21,10 @@ figure:
 
 Rules, hairlines and the thin boxes that ruled tables are made of are excluded
 by size - protecting them would pin down nothing, and a rule that spans a column
-would wrongly protect the paragraph beside it.
+would wrongly protect the paragraph beside it. A plain filled rectangle behind
+most of the page is excluded too: it is the page's background, which every
+slide exported from PowerPoint begins with, and clustering it would make the
+whole page one figure.
 """
 
 from __future__ import annotations
@@ -41,6 +44,9 @@ MIN_CLUSTER_AREA = 0.004
 #: ... and it must be at least this many points across in both directions, so a
 #: full-width hairline (large area, no height) is not mistaken for a figure.
 MIN_CLUSTER_SIDE = 14.0
+#: A single filled rectangle covering at least this fraction of the page is a
+#: background, not a figure.
+BACKGROUND_FILL_AREA = 0.5
 
 
 def _rect(value: Any) -> Rect:
@@ -77,15 +83,27 @@ def _tables(page: Any) -> list[Rect]:
     return found
 
 
+def _is_background(drawing: dict[str, Any], page_area: float) -> bool:
+    """A plain filled rectangle behind most of the page."""
+    items = drawing.get("items") or []
+    return (
+        drawing.get("type") == "f"
+        and len(items) == 1
+        and items[0][0] == "re"
+        and _rect(drawing["rect"]).area >= page_area * BACKGROUND_FILL_AREA
+    )
+
+
 def _drawing_clusters(page: Any) -> list[Rect]:
     if not hasattr(page, "cluster_drawings"):  # pragma: no cover - older PyMuPDF
         return []
+    page_area = max(1.0, page.rect.get_area())
     try:
-        clusters = page.cluster_drawings()
+        drawings = [d for d in page.get_drawings() if not _is_background(d, page_area)]
+        clusters = page.cluster_drawings(drawings=drawings) if drawings else []
     except Exception:
         log.warning("Drawing clustering failed on page %s", page.number, exc_info=True)
         return []
-    page_area = max(1.0, page.rect.get_area())
     kept: list[Rect] = []
     for cluster in clusters:
         rect = _rect(cluster)
@@ -124,4 +142,7 @@ def _merge_overlapping(rects: list[Rect]) -> list[Rect]:
 def protected_regions(page: Any) -> list[Rect]:
     """Every region of ``page`` that the translated page copies verbatim."""
     regions = _images(page) + _tables(page) + _drawing_clusters(page)
-    return _merge_overlapping(regions)
+    # A picture placed partly off the page is protected only where it shows.
+    bounds = _rect(page.rect)
+    visible = [clipped for r in regions if (clipped := r.intersection(bounds)) is not None]
+    return _merge_overlapping(visible)

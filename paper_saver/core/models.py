@@ -311,7 +311,7 @@ class PaperLayout:
     """
 
     #: Raise when a change to extraction should invalidate cached layouts.
-    VERSION = 7
+    VERSION = 8
 
     pages: list[PageLayout] = field(default_factory=list)
     version: int = VERSION

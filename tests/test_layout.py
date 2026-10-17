@@ -155,3 +155,16 @@ def test_a_sentence_about_a_figure_is_not_its_caption() -> None:
     assert _CAPTION_RE.match("FIG. 2. Accuracy")
     assert not _CAPTION_RE.match("Figure 1 illustrates the overview of the process.")
     assert not _CAPTION_RE.match("Table 2 shows that retrieval helps.")
+
+
+def test_a_slide_background_does_not_protect_the_whole_slide() -> None:
+    import pymupdf
+
+    from paper_saver.pdf.regions import protected_regions
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=720, height=540)
+    page.draw_rect(page.rect, color=None, fill=(1, 1, 1))  # PowerPoint's background
+    page.draw_rect(pymupdf.Rect(60, 300, 400, 500), color=(0, 0, 0), fill=(0.5, 0.6, 0.9))
+    regions = protected_regions(page)
+    assert regions and all(r.area < page.rect.get_area() * 0.5 for r in regions)
