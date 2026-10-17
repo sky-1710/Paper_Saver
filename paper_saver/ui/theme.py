@@ -7,7 +7,6 @@ QToolBar QToolButton { padding: 4px 9px; border-radius: 5px; }
 QToolBar QToolButton:hover { background: #e7eaee; }
 QToolBar QToolButton:checked { background: #dbe7fb; }
 QFrame#paneHeader { background: #3c4046; }
-QLabel#paneTitle { color: #e8eaed; padding: 0 4px; font-weight: 600; }
 QFrame#paneHeader QToolButton { color: #bdc1c6; background: transparent; border: none; border-radius: 4px; padding: 2px 9px; font-weight: 600; }
 QFrame#paneHeader QToolButton:hover { color: #ffffff; background: #4a4f56; }
 QFrame#paneHeader QToolButton:checked { color: #ffffff; background: #5f6368; }

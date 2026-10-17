@@ -1,9 +1,9 @@
 """One pane: a vertical strip of pages, with hover, click, drag and highlights.
 
-The same widget is the original on the left and the translation on the right;
-only ``translated`` differs. Page geometry comes from the session, so the two
-panes have identical heights at every zoom and one scroll position means the
-same place in both (§1.3).
+The same widget is the original and the translation; only ``translated``
+differs, and either pane can switch it (:meth:`PageCanvas.set_translated`).
+Page geometry comes from the session, so the two panes have identical heights
+at every zoom and one scroll position means the same place in both (§1.3).
 
 Hit testing is in PDF points. A mouse position is turned into (page, x, y)
 once, and everything after that - nearest sentence, word under the cursor,
@@ -240,6 +240,16 @@ class PageCanvas(QWidget):
         return QRectF(placed.x + rect.x0 * z, placed.y + rect.y0 * z, rect.width * z, rect.height * z)
 
     # -- state set from outside -------------------------------------------------
+
+    def set_translated(self, translated: bool) -> None:
+        """Show the translation, or the original. The highlights drawn on one
+        side are not the other's: the reader sets the range marks again."""
+        if translated == self.translated:
+            return
+        self.translated = translated
+        self._band = self._press = self._stroke = None
+        self._popup.hide()
+        self.update()
 
     def set_hover(self, sentence_id: str) -> None:
         if sentence_id != self._hover:

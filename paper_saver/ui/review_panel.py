@@ -1,8 +1,9 @@
-"""The right pane's 한 장 요약 and 코넬 노트 (§4d).
+"""한 장 요약 and 코넬 노트, in either pane (§4d).
 
-The pane above the translation can show, instead of it, a one-page review of
-the paper or Cornell notes on it, written by GPT on the reader's press and
-kept until they ask for a new one.
+Either pane can show, instead of the pages, a one-page review of the paper or
+Cornell notes on it, written by GPT on the reader's press and kept until they
+ask for a new one. Each pane has a panel of its own over the same documents;
+only one edits at a time, and an edit saved in one is drawn in the other.
 
 Read, the document is drawn with every part that cites the paper as a link:
 a point, a cue, a sentence of the summary, a section heading. Clicking one
@@ -52,7 +53,7 @@ _ABOUT = {
     "cornell": "왼쪽 <b>단서</b>(복습할 때 스스로 답해 볼 질문) · 오른쪽 <b>노트</b> · 아래 <b>요약</b>으로 된 "
     "코넬 노트를 만듭니다.",
 }
-_READ_HINT = "항목·단서·제목을 누르면 근거가 된 원문 문장이 왼쪽 PDF에 표시됩니다."
+_READ_HINT = "항목·단서·제목을 누르면 근거가 된 원문 문장이 옆 창의 PDF에 표시됩니다."
 _EDIT_HINT = (
     "Markdown으로 고칩니다 · 자동 저장 · Ctrl+클릭: p.N 링크의 원문 문장 보기 · "
     "원문 문장 우클릭 → '근거 링크 넣기'로 새 링크"
@@ -79,6 +80,9 @@ class ReviewPanel(QWidget):
     transcriptsChosen = Signal(list)
     transcriptRemoved = Signal(str)
     transcriptMoved = Signal(str, int)
+    #: The reader's edit of a document was saved: its kind. Another panel
+    #: showing the same document draws it again.
+    documentChanged = Signal(str)
 
     def __init__(
         self,
@@ -91,6 +95,9 @@ class ReviewPanel(QWidget):
         self.store = store
         #: The registered STT files as (name, file), in lecture order.
         self._transcripts = transcripts or (lambda: [])
+        #: Told the kind just before this panel starts editing it, so another
+        #: panel can save and let go: one editor at a time.
+        self.before_edit: Callable[[str], None] = lambda _kind: None
         self.kind = "one_page"
         self._generating: set[str] = set()
         self._errors: dict[str, str] = {}
@@ -241,7 +248,7 @@ class ReviewPanel(QWidget):
             )
             self.lead.setText(
                 f"<p style='font-size:12pt'><b>{KINDS[kind]}</b></p><p>{_ABOUT[kind]}</p>{spoken}"
-                "<p>항목마다 근거가 된 원문 문장이 연결되어, 누르면 왼쪽 PDF에서 그 문장을 보여 줍니다. "
+                "<p>항목마다 근거가 된 원문 문장이 연결되어, 누르면 옆 창의 PDF에서 그 문장을 보여 줍니다. "
                 "만든 뒤 <b>✎ 편집</b>으로 고칠 수 있습니다.</p>"
                 "<p style='color:#80868b; font-size:9pt'>PDF의 글 전체(그림·표 속 글 포함, 쪽 번호와 "
                 "참고문헌 목록 제외)와 등록한 강의 STT가 Codex를 통해 OpenAI로 전송됩니다. 만든 문서는 이 논문 폴더에 "
@@ -306,8 +313,8 @@ class ReviewPanel(QWidget):
     def _draw(self, doc: ReviewDoc) -> None:
         html, self._segments = review_html(doc.text, doc.kind, active=self._active)
         bar = self.view.verticalScrollBar()
-        same = self._drawn == (doc.kind, doc.text)
-        value = bar.value() if same else 0
+        # The same document, perhaps just edited in the other pane: keep the place.
+        value = bar.value() if self._drawn[0] == doc.kind else 0
         self._drawn = (doc.kind, doc.text)
         self.view.setHtml(html)
         # Tied to the bar: dropped, not run, if the panel is gone by then.
@@ -334,7 +341,7 @@ class ReviewPanel(QWidget):
         if self.stack.currentWidget() is not self.view:
             return
         if url.scheme() == "seg":
-            self.hint.setText("클릭: 이 부분의 근거가 된 원문 문장을 왼쪽 PDF에서 보기")
+            self.hint.setText("클릭: 이 부분의 근거가 된 원문 문장을 옆 창의 PDF에서 보기")
         else:
             self.hint.setText(_READ_HINT)
 
@@ -351,6 +358,7 @@ class ReviewPanel(QWidget):
 
     def set_editing(self, on: bool) -> None:
         if on and not self._editing:
+            self.before_edit(self.kind)
             doc = self.store.get(self.kind)
             if doc is None or self.kind in self._generating:
                 self._sync_button(False)
@@ -383,6 +391,13 @@ class ReviewPanel(QWidget):
             doc = self.store.get(self._editing)
             if doc is not None and self._editing == self.kind:
                 self.info.setText(self._info(doc))
+            self.documentChanged.emit(self._editing)
+
+    def stop_editing(self) -> None:
+        """Save, leave the editor, and show the document read again."""
+        if self._editing:
+            self._stop_editing()
+            self.refresh()
 
     def _editor_link(self, target: str) -> bool:
         if not target.startswith("ref:"):

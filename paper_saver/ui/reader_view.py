@@ -10,9 +10,12 @@ the region is rendered sharp and can be asked about in the GPT tab, pasted
 into the note, or copied. When GPT's answer cites sentences of the page, the
 reader scrolls to them and they stay lit until the next click on a page.
 
-The right pane can show, instead of the translation, a one-page review of the
-paper or Cornell notes on it (§4d); a part of either, clicked, lights the
-sentences it rests on in the original the same way.
+Each pane can show any of four things: the original, the translation, a
+one-page review of the paper or Cornell notes on it (§4d) - the original and
+the translation side by side as they start, or the PDF beside the notes, or
+the notes beside the summary. A part of a review, clicked, lights the
+sentences it rests on in whichever pane shows a page. Scrolling and zoom
+follow the pane that shows one, the left when both do.
 """
 
 from __future__ import annotations
@@ -141,8 +144,16 @@ class _Scroll(QScrollArea):
 
 #: The bar above each pane: one height for both, so their pages line up (§1.3).
 PANE_HEADER_HEIGHT = 28
-#: What the right pane can show, and the label of each.
-RIGHT_MODES = {"translation": "번역 (직역)", **REVIEW_KINDS}
+#: What either pane can show, and the label of each.
+PANE_MODES = {"original": "원문", "translation": "번역 (직역)", **REVIEW_KINDS}
+#: The pages, as opposed to a review in their place.
+PAGE_MODES = ("original", "translation")
+_MODE_TIPS = {
+    "one_page": "GPT가 쓴 논문 한 장 요약. 항목을 누르면 근거 문장을 원문에서 보여 줍니다.",
+    "cornell": "GPT가 쓴 코넬 노트(단서 · 노트 · 요약). 항목을 누르면 근거 문장을 원문에서 보여 줍니다.",
+}
+SIDES = ("left", "right")
+_SIDE_NAMES = {"left": "왼쪽", "right": "오른쪽"}
 
 
 def _scroll(canvas: PageCanvas) -> _Scroll:
@@ -278,9 +289,13 @@ class ReaderView(QWidget):
         self._quiz_pdf_task: BackgroundTask | None = None
         self.review_store = ReviewStore(project.root)
         self.review_store.bind(session.layout)
-        self.review_panel = ReviewPanel(
-            self.review_store, transcripts=lambda: [(m.name, m.file) for m in self.quiz_store.transcripts]
-        )
+        # One per pane, over the same documents.
+        self.review_panels = {
+            side: ReviewPanel(
+                self.review_store, transcripts=lambda: [(m.name, m.file) for m in self.quiz_store.transcripts]
+            )
+            for side in SIDES
+        }
         self._review_tasks: dict[str, BackgroundTask] = {}
         self.side = _SideTabs()
         self.side.addTab(self.dictionary_panel, "사전")
@@ -291,24 +306,30 @@ class ReaderView(QWidget):
         self.side.addTab(self.wordbook_panel, "단어장")
         self.side.setMinimumWidth(260)
 
-        title = QLabel("원문")
-        title.setObjectName("paneTitle")
-        left_box = _pane(_header(title), self.left_scroll)
-        # The right pane: the translation, or the review or Cornell notes in its place.
-        self._mode_buttons: dict[str, QToolButton] = {}
-        group = QButtonGroup(self)
-        for mode, label in RIGHT_MODES.items():
-            button = QToolButton(text=label, checkable=True)
-            button.clicked.connect(lambda _=False, m=mode: self.set_right_mode(m))
-            group.addButton(button)
-            self._mode_buttons[mode] = button
-        self._mode_buttons["translation"].setChecked(True)
-        self._mode_buttons["one_page"].setToolTip("GPT가 쓴 논문 한 장 요약. 항목을 누르면 근거 문장을 원문에서 보여 줍니다.")
-        self._mode_buttons["cornell"].setToolTip("GPT가 쓴 코넬 노트(단서 · 노트 · 요약). 항목을 누르면 근거 문장을 원문에서 보여 줍니다.")
-        self.right_stack = QStackedWidget()
-        self.right_stack.addWidget(self.right_scroll)
-        self.right_stack.addWidget(self.review_panel)
-        right_box = _pane(_header(*self._mode_buttons.values()), self.right_stack)
+        # Each pane: its pages, or a review in their place, chosen in its header.
+        self.canvases = {"left": self.left, "right": self.right}
+        self.scrolls = {"left": self.left_scroll, "right": self.right_scroll}
+        self.stacks: dict[str, QStackedWidget] = {}
+        self._mode_buttons: dict[str, dict[str, QToolButton]] = {}
+        self._modes = {"left": "original", "right": "translation"}
+        boxes = {}
+        for side in SIDES:
+            buttons: dict[str, QToolButton] = {}
+            group = QButtonGroup(self)
+            for mode, label in PANE_MODES.items():
+                button = QToolButton(text=label, checkable=True)
+                button.setToolTip(_MODE_TIPS.get(mode, ""))
+                button.clicked.connect(lambda _=False, s=side, m=mode: self.set_pane_mode(s, m))
+                group.addButton(button)
+                buttons[mode] = button
+            buttons[self._modes[side]].setChecked(True)
+            self._mode_buttons[side] = buttons
+            stack = QStackedWidget()
+            stack.addWidget(self.scrolls[side])
+            stack.addWidget(self.review_panels[side])
+            self.stacks[side] = stack
+            boxes[side] = _pane(_header(*buttons.values()), stack)
+        left_box, right_box = boxes["left"], boxes["right"]
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.addWidget(left_box)
@@ -366,8 +387,10 @@ class ReaderView(QWidget):
             canvas.sentenceMenu.connect(self._on_menu)
             canvas.noteClicked.connect(self._edit_note)
             canvas.markMenu.connect(self._on_mark_menu)
-        self.left.rangeHighlighted.connect(lambda page, rects, text: self._add_stroke("source", page, rects, text))
-        self.right.rangeHighlighted.connect(lambda page, rects, text: self._add_stroke("translated", page, rects, text))
+            # A stroke belongs to the side it was drawn on, whichever pane shows it.
+            canvas.rangeHighlighted.connect(
+                lambda page, rects, text, c=canvas: self._add_stroke(_side_of(c), page, rects, text)
+            )
         for scroll in (self.left_scroll, self.right_scroll):
             scroll.zoomStep.connect(self.zoom_step)
         ls, rs = self.left_scroll, self.right_scroll
@@ -375,7 +398,10 @@ class ReaderView(QWidget):
         rs.verticalScrollBar().valueChanged.connect(lambda v: self._sync(ls.verticalScrollBar(), v))
         ls.horizontalScrollBar().valueChanged.connect(lambda v: self._sync(rs.horizontalScrollBar(), v))
         rs.horizontalScrollBar().valueChanged.connect(lambda v: self._sync(ls.horizontalScrollBar(), v))
-        ls.verticalScrollBar().valueChanged.connect(self._track_page)
+        for side in SIDES:
+            self.scrolls[side].verticalScrollBar().valueChanged.connect(
+                lambda value, s=side: s == self._page_side() and self._track_page(value)
+            )
 
         self.dictionary_panel.lookupRequested.connect(
             lambda word, sentence: self.lookup(word, sentence, self.dictionary_panel.sentence_id, self.dictionary_panel.page)
@@ -414,17 +440,23 @@ class ReaderView(QWidget):
         self.quiz_panel.generateRequested.connect(self.generate_quiz)
         self.quiz_panel.stopRequested.connect(self.stop_quiz)
         self.quiz_panel.slideRequested.connect(self._show_slide)
-        for panel in (self.quiz_panel, self.review_panel):
+        for panel in (self.quiz_panel, *self.review_panels.values()):
             panel.transcriptsChosen.connect(self._register_transcripts)
             panel.transcriptRemoved.connect(self._remove_transcript)
             panel.transcriptMoved.connect(self._move_transcript)
         self.quiz_panel.stylesChosen.connect(self._register_styles)
         self.quiz_panel.pdfExportRequested.connect(self.export_quiz_pdf)
-        self.review_panel.generateRequested.connect(self.generate_review)
-        self.review_panel.stopRequested.connect(self.stop_review)
-        self.review_panel.evidenceRequested.connect(self._review_evidence)
-        self.review_panel.toNoteRequested.connect(self.review_to_note)
-        self.evidenceLit.connect(lambda count: count or self.review_panel.clear_active())
+        for side, panel in self.review_panels.items():
+            other = self.review_panels[_other(side)]
+            panel.generateRequested.connect(self.generate_review)
+            panel.stopRequested.connect(self.stop_review)
+            panel.evidenceRequested.connect(lambda ids, s=side: self._review_evidence(ids, s))
+            panel.toNoteRequested.connect(self.review_to_note)
+            # The same documents in both panes: one editor at a time, and an
+            # edit shows in the other.
+            panel.before_edit = lambda _kind, o=other: o.stop_editing()
+            panel.documentChanged.connect(lambda kind, o=other: o.kind == kind and o.refresh())
+        self.evidenceLit.connect(lambda count: count or [p.clear_active() for p in self.review_panels.values()])
         self.side.currentChanged.connect(lambda _i: self.side.currentWidget() is self.quiz_panel and self._load_deck())
         # Translations arrive after a sentence is marked; shown, the list is current.
         self.side.currentChanged.connect(
@@ -463,16 +495,25 @@ class ReaderView(QWidget):
         else:
             self.fit_width()
 
+    def _page_side(self) -> str | None:
+        """The pane that shows pages - the left when both do, None when neither."""
+        return next((side for side in SIDES if self._modes[side] in PAGE_MODES), None)
+
+    def _view(self) -> tuple[PageCanvas, _Scroll]:
+        """The canvas that scrolling and zoom follow, and its scroll area."""
+        side = self._page_side() or "left"
+        return self.canvases[side], self.scrolls[side]
+
     def fit_width(self) -> None:
         widest = max((self.session.page_size(n)[0] for n in range(self.session.page_count)), default=612)
-        available = self.left_scroll.viewport().width() - MARGIN * 2 - 4
+        available = self._view()[1].viewport().width() - MARGIN * 2 - 4
         self.set_zoom(max(0.3, available / widest))
 
     def zoom_step(self, direction: int) -> None:
         self.set_zoom(self.left.zoom * (1.12 if direction > 0 else 1 / 1.12))
 
     def set_zoom(self, zoom: float) -> None:
-        bar = self.left_scroll.verticalScrollBar()
+        bar = self._view()[1].verticalScrollBar()
         ratio = bar.value() / max(1, bar.maximum())
         self.left.set_zoom(zoom)
         self.right.set_zoom(zoom)
@@ -482,11 +523,13 @@ class ReaderView(QWidget):
 
     def goto_page(self, number: int) -> None:
         number = max(0, min(self.session.page_count - 1, number))
-        self.left_scroll.verticalScrollBar().setValue(self.left.page_top(number))
+        canvas, scroll = self._view()
+        scroll.verticalScrollBar().setValue(canvas.page_top(number))
 
     def _track_page(self, value: int) -> None:
-        probe = value + self.left_scroll.viewport().height() / 3
-        page = self.left.page_at_y(probe)
+        canvas, scroll = self._view()
+        probe = value + scroll.viewport().height() / 3
+        page = canvas.page_at_y(probe)
         if page != self._page:
             self._page = page
             self.pageChanged.emit(page)
@@ -502,8 +545,9 @@ class ReaderView(QWidget):
             return False
         rects = ref.sentence.rects(ref.block)
         top = rects[0].y0 if rects else ref.block.rect.y0
-        y = self.left.point_y(ref.page, top) - self.left_scroll.viewport().height() // 3
-        self.left_scroll.verticalScrollBar().setValue(max(0, y))
+        canvas, scroll = self._view()
+        y = canvas.point_y(ref.page, top) - scroll.viewport().height() // 3
+        scroll.verticalScrollBar().setValue(max(0, y))
         return True
 
     def _jump_to_bookmark(self, sentence_id: str, page: int) -> None:
@@ -763,10 +807,11 @@ class ReaderView(QWidget):
         menu.addAction("메모 추가…", lambda: self.add_note(sentence_id))
         menu.addAction(f"GPT 입력창에 넣기\t{_MOD}G", lambda: self.quote_to_gpt(sentence_id))
         menu.addAction("GPT에게 이 문장 설명 요청", lambda: self.quote_to_gpt(sentence_id, ask=True))
-        if self.review_panel.editing:
+        editing = next((p for p in self.review_panels.values() if p.editing), None)
+        if editing is not None:
             menu.addAction(
-                f"{REVIEW_KINDS[self.review_panel.kind]}에 근거 링크 넣기",
-                lambda: self.review_panel.insert_citation(sentence_id, ref.page),
+                f"{REVIEW_KINDS[editing.kind]}에 근거 링크 넣기",
+                lambda: editing.insert_citation(sentence_id, ref.page),
             )
         pens = menu.addMenu("형광펜")
         current = self.session.project.highlights.color_of(sentence_id)
@@ -813,11 +858,11 @@ class ReaderView(QWidget):
         colors = marks.colors()
         self.left.set_highlights(colors)
         self.right.set_highlights(colors)
-        for canvas, side in ((self.left, "source"), (self.right, "translated")):
+        for canvas in (self.left, self.right):
             canvas.set_range_marks([
                 RangeMark(s.id, s.page, tuple(Rect.from_list(r) for r in s.rects), s.color)
                 for s in marks.strokes
-                if s.side == side
+                if s.side == _side_of(canvas)
             ])
         self.bookmarks_panel.refresh()
 
@@ -1531,7 +1576,8 @@ class ReaderView(QWidget):
             if not self._closed:
                 message = "STT 등록: " + " / ".join(found)
                 self.quiz_panel.set_material_busy(False, message)
-                self.review_panel.refresh()
+                for panel in self.review_panels.values():
+                    panel.refresh()
                 self.statusMessage.emit(message)
 
         self._run_material(work, finished, f"STT {len(sources)}개를 읽는 중…")
@@ -1546,7 +1592,8 @@ class ReaderView(QWidget):
 
     def _transcripts_changed(self) -> None:
         self.quiz_panel.refresh_materials()
-        self.review_panel.refresh()
+        for panel in self.review_panels.values():
+            panel.refresh()
 
     def _register_styles(self, paths: list) -> None:
         if self._material_running():
@@ -1589,33 +1636,48 @@ class ReaderView(QWidget):
 
     # -- one-page review and Cornell notes (§4d) ------------------------------------------
 
-    @property
-    def right_mode(self) -> str:
-        """"translation", or the review the right pane shows in its place."""
-        return "translation" if self.right_stack.currentWidget() is self.right_scroll else self.review_panel.kind
+    def pane_mode(self, side: str) -> str:
+        """What a pane shows: "original", "translation", "one_page" or "cornell"."""
+        return self._modes[side]
 
-    def set_right_mode(self, mode: str) -> None:
-        if mode not in RIGHT_MODES:
+    def set_pane_mode(self, side: str, mode: str) -> None:
+        if side not in SIDES or mode not in PANE_MODES:
             return
-        self._mode_buttons[mode].setChecked(True)
-        if mode == "translation":
-            self.review_panel.flush()
-            self.right_stack.setCurrentWidget(self.right_scroll)
-            # Hidden, the translation kept scrolling with the original but was
-            # not laid out; line it up again once it is.
-            QTimer.singleShot(0, self, self._align_right)
+        self._mode_buttons[side][mode].setChecked(True)
+        panel, stack = self.review_panels[side], self.stacks[side]
+        before = self._page_side()
+        self._modes[side] = mode
+        if mode not in PAGE_MODES:
+            panel.set_kind(mode)
+            stack.setCurrentWidget(panel)
             return
-        self.review_panel.set_kind(mode)
-        self.right_stack.setCurrentWidget(self.review_panel)
+        panel.stop_editing()
+        self.canvases[side].set_translated(mode == "translation")
+        self._apply_highlights()
+        stack.setCurrentWidget(self.scrolls[side])
+        # Hidden, these pages kept scrolling with the others but were not laid
+        # out; line them up again once they are.
+        source = before if before != side else None
+        QTimer.singleShot(0, self, lambda: self._align(side, source))
 
-    def _align_right(self) -> None:
-        self._sync(self.right_scroll.verticalScrollBar(), self.left_scroll.verticalScrollBar().value())
-        self._sync(self.right_scroll.horizontalScrollBar(), self.left_scroll.horizontalScrollBar().value())
+    def _align(self, side: str, source: str | None) -> None:
+        """Line a pane's pages up with the other pane's, or with the page last in view."""
+        bars = self.scrolls[side]
+        if source is not None:
+            self._sync(bars.verticalScrollBar(), self.scrolls[source].verticalScrollBar().value())
+            self._sync(bars.horizontalScrollBar(), self.scrolls[source].horizontalScrollBar().value())
+        else:
+            self._sync(bars.verticalScrollBar(), self.canvases[side].page_top(self._page))
 
-    def _review_evidence(self, ids: list[str]) -> None:
+    def _review_evidence(self, ids: list[str], side: str = "right") -> None:
         found = [i for i in ids if self.session.sentence(i) is not None]
         if not found:
             self.statusMessage.emit("근거 문장을 이 논문에서 찾지 못했습니다. (링크가 가리키는 문장이 없습니다)")
+            return
+        if self._page_side() is None:
+            # Both panes show documents: the other one turns to the original.
+            self.set_pane_mode(_other(side), "original")
+            QTimer.singleShot(0, self, lambda: self._review_evidence(found, side))
             return
         self.show_evidence(found)
         pages = ", ".join(dict.fromkeys(f"p.{self._page_of(i) + 1}" for i in found))
@@ -1628,7 +1690,8 @@ class ReaderView(QWidget):
             return
         engine = self._engine_provider()
         if engine is None:
-            self.review_panel.set_error(kind, "GPT 사용에 동의하고 Codex가 설치되어 있어야 만들 수 있습니다.")
+            for panel in self.review_panels.values():
+                panel.set_error(kind, "GPT 사용에 동의하고 Codex가 설치되어 있어야 만들 수 있습니다.")
             return
         layout, title, store = self.session.layout, self.session.project.title, self.review_store
         pdf, deck = self.session.project.pdf_path, self._deck
@@ -1679,25 +1742,29 @@ class ReaderView(QWidget):
                 transcripts=list(names),
             )
             if not self._closed:
-                self.review_panel.set_generating(kind, False)
+                for panel in self.review_panels.values():
+                    panel.set_generating(kind, False)
                 self.statusMessage.emit(note or f"{REVIEW_KINDS[kind]} 완성 — 항목을 누르면 근거 문장을 원문에서 보여 줍니다.")
 
         def failed(exc: Exception) -> None:
             if self._closed:
                 return
-            self.review_panel.set_generating(kind, False)
+            for panel in self.review_panels.values():
+                panel.set_generating(kind, False)
             if isinstance(exc, TranslationCancelled):
                 self.statusMessage.emit("만들기를 멈췄습니다.")
                 return
             text = str(exc)
             if isinstance(exc, EnginePromptRejected):
                 text += "\n\nOpenAI가 이 논문의 본문을 거절했습니다. 부록을 뺀 본문도 거절되었습니다."
-            self.review_panel.set_error(kind, text)
+            for panel in self.review_panels.values():
+                panel.set_error(kind, text)
 
         task = BackgroundTask(work, name=f"review-{kind}")
         task.succeeded.connect(finished)
         task.failed.connect(failed)
-        self.review_panel.set_generating(kind, True)
+        for panel in self.review_panels.values():
+            panel.set_generating(kind, True)
         self._review_tasks[kind] = task.start()
 
     def stop_review(self, kind: str) -> None:
@@ -1707,7 +1774,8 @@ class ReaderView(QWidget):
 
     def review_to_note(self, kind: str) -> None:
         """The document into the note, its citations as page numbers."""
-        self.review_panel.flush()
+        for panel in self.review_panels.values():
+            panel.flush()
         doc = self.review_store.get(kind)
         if doc is None:
             return
@@ -1722,13 +1790,23 @@ class ReaderView(QWidget):
         self.cancel_capture()
         self.notes_panel.save_memo()
         self.note_panel.shutdown()
-        self.review_panel.flush()
+        for panel in self.review_panels.values():
+            panel.flush()
         self.stop_gpt()
         self.stop_quiz()
         for kind in list(self._review_tasks):
             self.stop_review(kind)
         if self._lookup_task is not None:
             self._lookup_task.cancel()
+
+
+def _side_of(canvas: PageCanvas) -> str:
+    """Which side of the paper a canvas shows, as highlights name it."""
+    return "translated" if canvas.translated else "source"
+
+
+def _other(side: str) -> str:
+    return "right" if side == "left" else "left"
 
 
 def _swatch(color: str) -> QIcon:

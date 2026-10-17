@@ -32,6 +32,8 @@ than by effort: those parts are never redrawn, so they cannot move.
 
 §1.3 The two panes therefore have identical geometry. Scrolling is shared, and
 a sentence's translation sits at the same y as its original. Alignment is free.
+Original on the left and translation on the right is where they start; either
+pane can show either side of the paper, or a review in its place (§4d.1).
 
 §1.4 What gets translated: body paragraphs, section headings, the title, and
 figure/table captions. What is left as original pixels: anything inside a
@@ -176,11 +178,16 @@ reader presses Regenerate.
 
 ## 4d. ONE-PAGE REVIEW AND CORNELL NOTES
 
-§4d.1 The right pane's header switches it between the translation and two
-documents GPT writes about the whole paper, on the reader's press: a one-page
-review (a one-line summary, then 문제와 동기 · 핵심 아이디어 · 방법 · 실험과
-결과 · 기여 · 한계와 의문 · 기억할 점) and Cornell notes (cue | notes rows in
-reading order, a summary beneath). The PDF stays on the left.
+§4d.1 Each pane's header switches it between the original, the translation
+and two documents GPT writes about the whole paper, on the reader's press: a
+one-page review (a one-line summary, then 문제와 동기 · 핵심 아이디어 · 방법 ·
+실험과 결과 · 기여 · 한계와 의문 · 기억할 점) and Cornell notes (cue | notes rows
+in reading order, a summary beneath). The panes start as original |
+translation; the left can as well show the notes beside the PDF on the
+right, or both panes documents. Scrolling and zoom follow the pane that shows
+pages. A click on a point when neither does turns the other pane to the
+original. Each pane has its own review panel over the same documents: one
+edits at a time, and an edit saved in one is drawn in the other.
 
 §4d.2 Every point rests on the paper. GPT sees all of its text - a lecture's
 tables, diagrams and code are its content - with each sentence tagged `[S12]`,

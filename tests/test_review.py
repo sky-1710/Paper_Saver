@@ -325,9 +325,9 @@ def test_review_mode_makes_shows_edits_and_leads_to_the_paper(
     }
     engine = FakeEngine([json.dumps(answer)], delay=0.2)
     reader._engine_provider = lambda: engine
-    reader.set_right_mode("cornell")
-    assert reader.right_mode == "cornell"
-    panel = reader.review_panel
+    reader.set_pane_mode("right", "cornell")
+    assert reader.pane_mode("right") == "cornell"
+    panel = reader.review_panels["right"]
     assert panel.stack.currentWidget() is panel._empty
 
     # The lecture was recorded in two parts; both go, in order, shared with the quiz.
@@ -384,6 +384,73 @@ def test_review_mode_makes_shows_edits_and_leads_to_the_paper(
     assert "(p.1)" in reader.note_panel.editor.toPlainText()
     assert "ref:" not in reader.note_panel.editor.toPlainText()
 
-    reader.set_right_mode("translation")
-    assert reader.right_stack.currentWidget() is reader.right_scroll
+    reader.set_pane_mode("right", "translation")
+    assert reader.stacks["right"].currentWidget() is reader.right_scroll
+    window.close()
+
+
+def test_either_pane_shows_any_of_the_four(
+    qapp, tmp_path: Path, two_column_pdf: Path, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    from PySide6.QtCore import QUrl
+
+    from paper_saver.config import Settings
+    from paper_saver.core.geometry import Rect as PageRect
+    from paper_saver.ui.main_window import MainWindow, _prepare
+
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("auto_translate", False)
+    window = MainWindow(settings)
+    window.resize(1400, 900)
+    window.show()
+    project, layout = _prepare(two_column_pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    window._opened((project, layout))
+    qapp.processEvents()
+    reader = window.reader
+    ids = [s.id for _, _, s in layout.sentences()]
+    for kind in ("one_page", "cornell"):
+        reader.review_store.put(kind, f"# 문서\n\n- 첫 점. [p.1](ref:{ids[1]})\n- 둘째 점. [p.1](ref:{ids[2]})\n", anchors={})
+    assert reader.pane_mode("left") == "original" and reader.pane_mode("right") == "translation"
+
+    # The translation on the left and the original on the right: strokes
+    # belong to the side of the paper they were drawn on.
+    reader.set_pane_mode("left", "translation")
+    reader.set_pane_mode("right", "original")
+    assert reader.left.translated and not reader.right.translated
+    reader.set_pen("#ffd400")
+    reader.left.rangeHighlighted.emit(0, [PageRect(60, 200, 200, 210)], "번역 부분")
+    assert project.highlights.strokes[-1].side == "translated"
+
+    # Cornell notes on the left, the PDF on the right: a point lights the right.
+    reader.set_pane_mode("left", "cornell")
+    qapp.processEvents()
+    left = reader.review_panels["left"]
+    assert reader.stacks["left"].currentWidget() is left and left.stack.currentWidget() is left.view
+    point = next(n for n, refs in enumerate(left._segments) if refs == [ids[2]])
+    left._clicked(QUrl(f"seg:{point}"))
+    assert reader.right._evidence == [ids[2]]
+
+    # One editor at a time, and an edit shows in the other pane.
+    right = reader.review_panels["right"]
+    reader.set_pane_mode("right", "cornell")
+    left.set_editing(True)
+    left.editor.setPlainText(left.editor.toPlainText().replace("첫 점", "고친 점"))
+    left.editor.edited.emit()
+    right.set_editing(True)
+    assert not left.editing and right.editing
+    assert "고친 점" in reader.review_store.get("cornell").text and "고친 점" in right.editor.toPlainText()
+    right.editor.setPlainText(right.editor.toPlainText().replace("둘째 점", "다시 고친 점"))
+    right.flush()
+    assert "다시 고친 점" in left.view.toPlainText()
+    right.set_editing(False)
+
+    # Documents in both panes: a click turns the other pane to the original.
+    reader.set_pane_mode("right", "one_page")
+    qapp.processEvents()
+    point = next(n for n, refs in enumerate(right._segments) if refs == [ids[1]])
+    right._clicked(QUrl(f"seg:{point}"))
+    _wait(qapp, lambda: reader.left._evidence == [ids[1]])
+    assert reader.pane_mode("left") == "original" and not reader.left.translated
     window.close()
