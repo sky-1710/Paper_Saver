@@ -11,6 +11,7 @@ QFrame#paneHeader QToolButton { color: #bdc1c6; background: transparent; border:
 QFrame#paneHeader QToolButton:hover { color: #ffffff; background: #4a4f56; }
 QFrame#paneHeader QToolButton:checked { color: #ffffff; background: #5f6368; }
 QLabel#reviewLead { font-size: 10.5pt; color: #3c4043; }
+QPushButton#modeButton { padding: 3px 10px; }
 QLabel#sectionTitle { font-weight: 600; color: #333; padding: 2px 0; }
 QLabel#muted { color: #888; font-size: 9pt; }
 QFrame#pairBar { background: #fbfaf5; border-top: 1px solid #e3e0d4; }

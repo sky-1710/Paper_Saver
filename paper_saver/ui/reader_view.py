@@ -69,7 +69,6 @@ from ..core.lecture import (
     extract_quiz_examples,
     format_quiz_examples,
     parse_transcript,
-    transcript_by_page,
     transcript_excerpt,
 )
 from ..core.notebook import IMAGE_SUFFIXES
@@ -77,7 +76,7 @@ from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
 from ..core.project import HIGHLIGHT_COLORS, Project, WordEntry
 from ..core.quiz import QuizStore, id_prefix
 from ..core.review import KINDS as REVIEW_KINDS
-from ..core.review import ReviewStore, paper_text, plain_citations, refs_in
+from ..core.review import ReviewStore, plain_citations, refs_in
 from ..pdf.document import PaperDocument
 from ..pdf.text import MaterialError, read_pages, read_paper, stray_lines
 from ..render.quiz_pdf import PLACEMENTS, quiz_pdf, slides_quiz_pdf
@@ -98,7 +97,7 @@ from ..translate.prompts import (
     sentence_tag,
 )
 from ..translate.quiz import CodexQuizGenerator, QuizGenerationInput
-from ..translate.review import CodexReviewGenerator, ReviewRequest
+from ..translate.review import CodexReviewGenerator, ReviewRequest, default_lecture, review_request
 from .bookmarks_panel import BookmarksPanel
 from .chat_panel import ChatPanel
 from .dictionary_panel import DictionaryPanel
@@ -292,7 +291,8 @@ class ReaderView(QWidget):
         # One per pane, over the same documents.
         self.review_panels = {
             side: ReviewPanel(
-                self.review_store, transcripts=lambda: [(m.name, m.file) for m in self.quiz_store.transcripts]
+                self.review_store, transcripts=lambda: [(m.name, m.file) for m in self.quiz_store.transcripts],
+                default_mode=self._default_review_mode,
             )
             for side in SIDES
         }
@@ -456,6 +456,7 @@ class ReaderView(QWidget):
             # edit shows in the other.
             panel.before_edit = lambda _kind, o=other: o.stop_editing()
             panel.documentChanged.connect(lambda kind, o=other: o.kind == kind and o.refresh())
+            panel.modeChosen.connect(lambda _mode, o=other: o.refresh())
         self.evidenceLit.connect(lambda count: count or [p.clear_active() for p in self.review_panels.values()])
         self.side.currentChanged.connect(lambda _i: self.side.currentWidget() is self.quiz_panel and self._load_deck())
         # Translations arrive after a sentence is marked; shown, the list is current.
@@ -1636,6 +1637,11 @@ class ReaderView(QWidget):
 
     # -- one-page review and Cornell notes (§4d) ------------------------------------------
 
+    def _default_review_mode(self) -> str:
+        """강의 모드 for slides or a paper with its STT, 논문 모드 otherwise."""
+        lecture = default_lecture(self.session.layout, bool(self.quiz_store.transcripts))
+        return "lecture" if lecture else "paper"
+
     def pane_mode(self, side: str) -> str:
         """What a pane shows: "original", "translation", "one_page" or "cornell"."""
         return self._modes[side]
@@ -1697,37 +1703,39 @@ class ReaderView(QWidget):
         pdf, deck = self.session.project.pdf_path, self._deck
         transcripts = self.quiz_store.transcript_parts()
         names = tuple(name for name, _ in transcripts)
+        styles = self.quiz_store.style_text()
+        mode = self.review_panels["left"].mode
+        lecture = mode == "lecture"
 
         def work(cancel, _report):  # type: ignore[no-untyped-def]
-            pages = {s.id: page.number for page, _, s in layout.sentences()}
             try:
                 strays = stray_lines(pdf, layout)
             except Exception:  # pymupdf raises several unrelated types
                 log.warning("Could not read the lines the layout left out", exc_info=True)
                 strays = {}
-            spoken: dict[int, str] = {}
-            if transcripts:
-                # Matched to the slides as the quiz matches them, all of it.
-                sections = combine_transcripts([parse_transcript(text) for _, text in transcripts])
-                spoken = transcript_by_page((deck or SlideDeck(read_pages(pdf))).pages, sections)
-            text, numbering = paper_text(layout, strays=strays, spoken=spoken)
-            if not numbering:
+            # The STT is matched to the slides as the quiz matches them, all of it.
+            slides = (deck or SlideDeck(read_pages(pdf))).pages if transcripts else []
+
+            def ask(until_references: bool = False) -> ReviewRequest:
+                return review_request(
+                    kind, title, layout, strays=strays, transcripts=transcripts, slides=slides, styles=styles,
+                    lecture=lecture, until_references=until_references,
+                )
+
+            request = ask()
+            if not request.numbering:
                 raise TranslationError("이 PDF에서 정리할 본문 문장을 찾지 못했습니다. (스캔한 PDF에는 글자가 없습니다)")
             generator = CodexReviewGenerator(engine)
             note = ""
             try:
-                markdown = generator.generate(
-                    ReviewRequest(kind, title, text, numbering, pages, transcripts=names), cancel=cancel
-                )
+                markdown = generator.generate(request, cancel=cancel)
             except EnginePromptRejected:
                 # A grading prompt quoted in an appendix will do it: the paper
                 # up to its references, once more.
-                shorter, cut = paper_text(layout, strays=strays, spoken=spoken, until_references=True)
-                if not cut or len(shorter) >= len(text):
+                shorter = ask(until_references=True)
+                if not shorter.numbering or len(shorter.text) >= len(request.text):
                     raise
-                markdown = generator.generate(
-                    ReviewRequest(kind, title, shorter, cut, pages, transcripts=names), cancel=cancel
-                )
+                markdown = generator.generate(shorter, cancel=cancel)
                 note = "OpenAI가 논문 전체를 거절해서(부록에 인용된 프롬프트 때문일 때가 많습니다) 참고문헌 앞까지만 보내 만들었습니다."
             texts = {s.id: s.text for _, _, s in layout.sentences()}
             anchors = {i: texts[i] for i in refs_in(markdown) if i in texts}
@@ -1739,7 +1747,7 @@ class ReaderView(QWidget):
             model = str(getattr(engine, "chat_model", "") or "")
             store.put(
                 kind, markdown, anchors=anchors, engine=str(getattr(engine, "key", "")), model=model,
-                transcripts=list(names),
+                transcripts=list(names), mode=mode,
             )
             if not self._closed:
                 for panel in self.review_panels.values():

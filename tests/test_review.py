@@ -252,6 +252,47 @@ def test_generator_sends_the_paper_first_and_retries_with_the_reason() -> None:
     assert "강의 STT 규칙" not in engine.prompts[0]
 
 
+def test_a_lecture_is_weighted_by_time_and_repetition() -> None:
+    from paper_saver.core.review import paper_text
+    from paper_saver.translate.review import (
+        ReviewRequest,
+        page_notes,
+        review_prompt,
+        review_request,
+    )
+
+    layout = _layout()
+    notes = page_notes({0: 557, 1: 45}, {0: 6, 1: 1, 2: 3})
+    assert notes == {0: "강의 9분 17초 · 6번 띄움", 1: "강의 45초", 2: "3번 띄움"}
+    text, _ = paper_text(layout, notes=notes)
+    assert text.startswith("[p.1] (강의 9분 17초 · 6번 띄움)\n") and "[p.2] (강의 45초)\n" in text
+
+    paper = review_prompt(ReviewRequest("one_page", "Attn", text))
+    assert "문제와 동기" in paper and "시험 대비" not in paper and "강의 자료 규칙" not in paper
+
+    lecture = ReviewRequest(
+        "one_page", "OS08", text, lecture=True, seconds={0: 557, 1: 45, 2: 5}, visits={0: 6, 2: 3, 1: 1},
+        terms=(("reference bit", 40, 5), ("LRU", 44, 9)), styles="1. Traps are rare. (X)",
+    )
+    prompt = review_prompt(lecture)
+    assert "강의 자료 규칙" in prompt and "헷갈리기 쉬운 점" in prompt and "문제와 동기" not in prompt
+    assert "시간과 반복한 횟수" in prompt
+    assert "- 오래 설명한 쪽: p.1 9분 17초, p.2 45초, p.3 5초" in prompt
+    assert "- 여러 번 다시 띄운 쪽: p.1 6번, p.3 3번" in prompt  # once is no repetition
+    assert "- 강의에서 여러 번 말한 용어: reference bit 40회(5개 쪽), LRU 44회(9개 쪽)" in prompt
+    assert "Traps are rare" in prompt and prompt.index("[교수님 이전 퀴즈") > prompt.index("[본문]")
+    cornell = review_prompt(ReviewRequest("cornell", "OS08", text, lecture=True))
+    assert "10~16개" in cornell and "중요하게 다룬 곳" not in cornell and "교수님 이전 퀴즈" not in cornell
+
+    # The mode starts from what the PDF looks like; the reader's choice wins.
+    plain = review_request("one_page", "Attn", layout, styles="1. Traps are rare. (X)")
+    assert not plain.lecture and plain.styles == ""
+    slides = PaperLayout([PageLayout(n, 720, 540, page.blocks) for n, page in enumerate(layout.pages)])
+    assert review_request("one_page", "OS08", slides, styles="1. Traps (X)").lecture
+    assert not review_request("one_page", "OS08", slides, lecture=False).lecture
+    assert review_request("one_page", "Attn", layout, lecture=True).lecture
+
+
 def test_the_prompt_says_how_to_use_the_lecture_stt() -> None:
     from paper_saver.translate.review import ReviewRequest, review_prompt
 
@@ -352,6 +393,15 @@ def test_review_mode_makes_shows_edits_and_leads_to_the_paper(
     assert spoken.index("[영상 2 · Slide 1") < spoken.index("the SEED accuracy is key")
     assert reader.review_store.get("cornell").transcripts == ["lecture part 1.md", "lecture part 2.md"]
     assert "STT 2개 반영" in panel.info.text()
+    # With its STT the paper is a lecture until the reader says otherwise.
+    assert panel.mode == "lecture" and panel.mode_buttons["lecture"].isChecked()
+    assert "강의 자료 규칙" in engine.prompts[0] and "[강의에서 중요하게 다룬 곳" in engine.prompts[0]
+    assert reader.review_store.get("cornell").mode == "lecture" and "강의 모드" in panel.info.text()
+    panel.mode_buttons["paper"].click()
+    assert reader.review_store.mode == "paper" and reader.review_panels["left"].mode == "paper"
+    assert reader.review_panels["left"].mode_buttons["paper"].isChecked()
+    assert "강의 모드로 만듦 → 다시 만들기로 반영" in panel.info.text()
+    panel.choose_mode("lecture")
     reader._move_transcript(reader.quiz_store.transcripts[1].file, -1)
     assert "STT가 바뀜" in panel.info.text()
     assert reader.quiz_panel.stt_list.item(0).text() == "1. lecture part 2.md"

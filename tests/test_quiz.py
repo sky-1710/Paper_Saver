@@ -295,6 +295,53 @@ def test_a_lecture_recorded_in_parts_is_one_lecture() -> None:
     assert sum(map(len, cut.values())) < sum(map(len, by_page.values()))
 
 
+def test_how_long_the_lecture_stayed_on_each_slide() -> None:
+    from paper_saver.core.lecture import format_duration, parse_transcript, seconds_by_page
+
+    sections = parse_transcript(
+        "## Slide 1\n`00:00:00 – 00:00:30`\nmemory is the topic today\n"
+        "## Slide 2\n`00:00:30 – 00:09:47`\nevery process has a private address space virtual view\n"
+        "## Slide 3\n`00:09:47 – 00:10:02`\nstack memory allocated implicitly by the compiler"
+    )
+    assert seconds_by_page(SLIDES, sections) == {0: 30, 1: 557, 2: 15}
+    assert format_duration(557) == "9분 17초" and format_duration(45) == "45초"
+    assert seconds_by_page(SLIDES, parse_transcript("memory private address space " * 50)) == {}  # no times
+
+
+def test_what_the_professor_came_back_to_and_kept_saying() -> None:
+    from paper_saver.core.lecture import (
+        align_transcript,
+        parse_transcript,
+        repeated_terms,
+        visits_by_page,
+    )
+
+    slides = [
+        "Page Replacement\nLRU algorithm",
+        "Reference bits\nEach page has a reference bit set by the MMU",
+        "History register\nThe history register keeps eight reference bits",
+        "Thrashing\nToo little memory: the process pages all the time",
+        "Summary\nmemory pages",
+    ]
+    said = (
+        "## Slide 1\nLRU evicts the page used longest ago. LRU needs the time of every access. LRU again. LRU.\n"
+        "## Slide 2\nthe reference bit is set on access. the reference bit is cleared. so the reference bit "
+        "tells use. one more reference bit. and the reference bit again.\n"
+        "## Slide 3\nthe history register shifts. a history register per page. history register value. "
+        "history register compared.\n"
+        "## Slide 4 · Same as Slide 2\nback to the reference bit\n"
+        "## Slide 5\nthrashing happens when memory is short"
+    )
+    sections = parse_transcript(said)
+    mapping = align_transcript(slides, sections)
+    assert visits_by_page(sections, mapping)[1] == 2  # shown, then come back to
+    assert visits_by_page(parse_transcript("lru " * 400), {0: [0]}) == {}  # no slide markers, no visits
+    # Terms of two or three words and acronyms; "access", "page", "memory" are no terms.
+    assert repeated_terms(slides, sections, mapping) == [
+        ("reference bit", 6, 1), ("history register", 4, 1), ("LRU", 4, 1),
+    ]
+
+
 def test_transcript_without_markers_is_chunked_and_still_matched() -> None:
     from paper_saver.core.lecture import CHUNK_CHARS, align_transcript, parse_transcript
 

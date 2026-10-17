@@ -25,6 +25,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -38,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.review import KINDS, ReviewDoc, ReviewStore, plain_citations
+from ..core.review import KINDS, MODES, ReviewDoc, ReviewStore, plain_citations
 from ..pdf.text import MATERIAL_SUFFIXES
 from ..render.review import LINK_STYLE, review_html
 from .live_markdown import LiveMarkdownEdit
@@ -47,11 +48,17 @@ __all__ = ["ReviewPanel"]
 
 #: Each kind with its object particle, for sentences that need one.
 _OBJECT = {"one_page": "한 장 요약을", "cornell": "코넬 노트를"}
+#: What each document is, in each mode.
 _ABOUT = {
-    "one_page": "논문 전체를 A4 한 장 분량으로 정리합니다: 한 줄 요약, 문제와 동기, 핵심 아이디어, 방법, "
-    "실험과 결과, 기여, 한계와 의문, 기억할 점.",
-    "cornell": "왼쪽 <b>단서</b>(복습할 때 스스로 답해 볼 질문) · 오른쪽 <b>노트</b> · 아래 <b>요약</b>으로 된 "
-    "코넬 노트를 만듭니다.",
+    ("one_page", "paper"): "<b>논문 모드</b> · 논문 전체를 A4 한 장 분량의 리뷰로 정리합니다: 한 줄 요약, 문제와 동기, "
+    "핵심 아이디어, 방법, 실험과 결과, 기여, 한계와 의문, 기억할 점.",
+    ("one_page", "lecture"): "<b>강의 모드</b> · 강의를 시험 대비로 A4 한 장에 정리합니다: 주제마다 판단 규칙·조건·차이·"
+    "예제 수치, 끝에 <b>헷갈리기 쉬운 점</b>. 교수님이 오래 설명하고 반복한 곳(STT의 시간·다시 띄운 횟수·"
+    "반복해 말한 용어)에 비중을 둡니다.",
+    ("cornell", "paper"): "<b>논문 모드</b> · 왼쪽 <b>단서</b>(복습할 때 스스로 답해 볼 질문) · 오른쪽 <b>노트</b> · "
+    "아래 <b>요약</b>으로 된 코넬 노트를 만듭니다.",
+    ("cornell", "lecture"): "<b>강의 모드</b> · 강의 흐름대로 <b>단서</b>(답이 하나로 정해지는 시험 문제형 질문) · "
+    "<b>노트</b>(규칙·조건·차이·수치) · <b>요약</b>. 교수님이 오래 설명하고 반복한 곳에 비중을 둡니다.",
 }
 _READ_HINT = "항목·단서·제목을 누르면 근거가 된 원문 문장이 옆 창의 PDF에 표시됩니다."
 _EDIT_HINT = (
@@ -83,6 +90,8 @@ class ReviewPanel(QWidget):
     #: The reader's edit of a document was saved: its kind. Another panel
     #: showing the same document draws it again.
     documentChanged = Signal(str)
+    #: The reader chose 강의 모드 ("lecture") or 논문 모드 ("paper").
+    modeChosen = Signal(str)
 
     def __init__(
         self,
@@ -90,11 +99,14 @@ class ReviewPanel(QWidget):
         parent: QWidget | None = None,
         *,
         transcripts: Callable[[], list[tuple[str, str]]] | None = None,
+        default_mode: Callable[[], str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.store = store
         #: The registered STT files as (name, file), in lecture order.
         self._transcripts = transcripts or (lambda: [])
+        #: The mode until the reader chooses one: what the PDF looks like.
+        self._default_mode = default_mode or (lambda: "paper")
         #: Told the kind just before this panel starts editing it, so another
         #: panel can save and let go: one editor at a time.
         self.before_edit: Callable[[str], None] = lambda _kind: None
@@ -133,11 +145,31 @@ class ReviewPanel(QWidget):
         self._stt_menu = QMenu(self.stt_button)
         self._stt_menu.aboutToShow.connect(self._fill_stt_menu)
         self.stt_button.setMenu(self._stt_menu)
+        # 강의 모드 | 논문 모드: how both documents of this paper are written.
+        self.mode_buttons: dict[str, QPushButton] = {}
+        group = QButtonGroup(self)
+        tips = {
+            "lecture": "시험 대비로 씁니다: 판단 규칙·조건·차이·예제 수치, 헷갈리기 쉬운 점.\n"
+            "STT가 있으면 교수님이 오래 설명하고 반복한 곳에 비중을 둡니다.",
+            "paper": "논문 리뷰로 씁니다: 문제와 동기, 핵심 아이디어, 방법, 실험과 결과, 기여, 한계와 의문.",
+        }
+        for mode, label in MODES.items():
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setObjectName("modeButton")
+            button.setToolTip(tips[mode] + "\n바꾼 뒤 '다시 만들기'로 반영됩니다.")
+            button.clicked.connect(lambda _=False, m=mode: self.choose_mode(m))
+            group.addButton(button)
+            self.mode_buttons[mode] = button
         head = QHBoxLayout()
-        head.addWidget(self.info, 1)
+        head.setSpacing(4)
+        for button in self.mode_buttons.values():
+            head.addWidget(button)
+        head.addStretch(1)
         head.addWidget(self.stt_button)
         head.addWidget(self.edit_button)
         head.addWidget(self.more)
+        self.info.setWordWrap(True)
 
         self.error = QLabel()
         self.error.setObjectName("quizError")
@@ -185,6 +217,7 @@ class ReviewPanel(QWidget):
         layout.setContentsMargins(10, 8, 10, 6)
         layout.setSpacing(6)
         layout.addLayout(head)
+        layout.addWidget(self.info)
         layout.addWidget(self.error)
         layout.addWidget(self.stack, 1)
         layout.addWidget(self.hint)
@@ -210,6 +243,11 @@ class ReviewPanel(QWidget):
         busy = kind in self._generating
         shown = doc is not None and not busy
         self.info.setText(self._info(doc) if shown else "")
+        self.info.setVisible(shown)
+        mode = self.mode
+        for name, button in self.mode_buttons.items():
+            button.setChecked(name == mode)
+            button.setEnabled(not busy)
         count = len(self._transcripts())
         self.stt_button.setText(f"🎙 STT {count}개" if count else "🎙 강의 STT")
         self.stt_button.setEnabled(not busy)
@@ -247,7 +285,7 @@ class ReviewPanel(QWidget):
                 "있습니다. 나눠 찍은 영상은 여러 개를 강의 순서대로 넣으세요.</p>"
             )
             self.lead.setText(
-                f"<p style='font-size:12pt'><b>{KINDS[kind]}</b></p><p>{_ABOUT[kind]}</p>{spoken}"
+                f"<p style='font-size:12pt'><b>{KINDS[kind]}</b></p><p>{_ABOUT[(kind, self.mode)]}</p>{spoken}"
                 "<p>항목마다 근거가 된 원문 문장이 연결되어, 누르면 옆 창의 PDF에서 그 문장을 보여 줍니다. "
                 "만든 뒤 <b>✎ 편집</b>으로 고칠 수 있습니다.</p>"
                 "<p style='color:#80868b; font-size:9pt'>PDF의 글 전체(그림·표 속 글 포함, 쪽 번호와 "
@@ -262,6 +300,8 @@ class ReviewPanel(QWidget):
         parts = []
         if doc.generated:
             parts.append(f"{_when(doc.generated)} 생성")
+        if doc.mode in MODES:
+            parts.append(MODES[doc.mode] if doc.mode == self.mode else f"{MODES[doc.mode]}로 만듦 → 다시 만들기로 반영")
         if doc.model:
             parts.append(doc.model)
         now = [name for name, _ in self._transcripts()]
@@ -274,6 +314,21 @@ class ReviewPanel(QWidget):
         if doc.edited:
             parts.append("편집함")
         return " · ".join(parts)
+
+    # -- 강의 모드 | 논문 모드 ---------------------------------------------------------------
+
+    @property
+    def mode(self) -> str:
+        """"lecture" or "paper": the reader's choice, or what the PDF looks like."""
+        return self.store.mode or self._default_mode()
+
+    def choose_mode(self, mode: str) -> None:
+        if mode not in MODES or mode == self.store.mode:
+            self.refresh()
+            return
+        self.store.set_mode(mode)
+        self.refresh()
+        self.modeChosen.emit(mode)
 
     # -- the lecture's STT ---------------------------------------------------------------
 

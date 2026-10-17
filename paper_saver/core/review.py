@@ -42,12 +42,14 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "KINDS",
+    "MODES",
     "PAPER_CHARS",
     "ReviewDoc",
     "ReviewFormatError",
     "ReviewStore",
     "Segment",
     "cite",
+    "looks_like_slides",
     "paper_text",
     "plain_citations",
     "refs_in",
@@ -57,6 +59,8 @@ __all__ = [
 
 #: The documents there are, by key, as the reader sees them named.
 KINDS = {"one_page": "한 장 요약", "cornell": "코넬 노트"}
+#: How a document is written: for the exam, or as a reader's review of a paper.
+MODES = {"lecture": "강의 모드", "paper": "논문 모드"}
 #: The paper text sent, at most: a long paper without its reference list is
 #: 60-150k characters.
 PAPER_CHARS = 300_000
@@ -95,6 +99,12 @@ STRAY_LABEL = "(따로 읽은 글)"
 SPOKEN_LABEL = "(강의 STT — 이 쪽을 설명한 부분)"
 
 
+def looks_like_slides(layout: PaperLayout) -> bool:
+    """Whether the PDF is a slide deck: most of its pages are landscape."""
+    pages = layout.pages
+    return bool(pages) and sum(1 for page in pages if page.width > page.height * 1.1) * 2 > len(pages)
+
+
 def _appendix_heading(text: str) -> bool:
     line = _norm(text)
     return len(line) <= 80 and not _YEAR.search(line) and bool(_APPENDIX.match(line))
@@ -105,6 +115,7 @@ def paper_text(
     *,
     strays: Mapping[int, list[str]] | None = None,
     spoken: Mapping[int, str] | None = None,
+    notes: Mapping[int, str] | None = None,
     until_references: bool = False,
     limit: int = PAPER_CHARS,
 ) -> tuple[str, dict[int, str]]:
@@ -118,7 +129,10 @@ def paper_text(
     text box the layout could not read is still the slide. ``spoken`` adds,
     by page, what the lecture's STT said over it (``core.lecture.
     transcript_by_page``), under :data:`SPOKEN_LABEL`; ``limit`` is for the
-    document's own text and the STT comes on top of it.
+    document's own text and the STT comes on top of it. ``notes`` says, by
+    page, what the lecture made of it - how long it stayed there and how
+    often it came back - written after the page's mark:
+    ``[p.24] (강의 5분 26초 · 6번 띄움)``.
 
     Every page is headed ``[p.N]`` and every sentence GPT may cite is tagged
     ``[S1]``, ``[S2]``… across the whole paper. Text inside figures has no
@@ -170,7 +184,9 @@ def paper_text(
         if spoken and not stop and spoken.get(page.number, "").strip():
             paragraphs.append(f"{SPOKEN_LABEL}\n{spoken[page.number].strip()}")
         if paragraphs:
-            pages.append(f"[p.{page.number + 1}]\n" + "\n\n".join(paragraphs))
+            note = (notes or {}).get(page.number)
+            mark = f"[p.{page.number + 1}]" + (f" ({note})" if note else "")
+            pages.append(f"{mark}\n" + "\n\n".join(paragraphs))
         if stop:
             break
     text = "\n\n".join(pages)
@@ -387,6 +403,8 @@ class ReviewDoc:
     edited: str = ""
     #: The lecture STT files it was made with, by name.
     transcripts: list[str] = field(default_factory=list)
+    #: The mode it was written in: "lecture" or "paper".
+    mode: str = ""
 
 
 class ReviewStore:
@@ -400,6 +418,8 @@ class ReviewStore:
         self.docs: dict[str, ReviewDoc] = {}
         #: Sentence id -> its text, for every sentence a document was made citing.
         self.anchors: dict[str, str] = {}
+        #: The mode the reader chose for this paper; "" leaves it to the PDF.
+        self.mode = ""
         self._load()
 
     def _load(self) -> None:
@@ -410,10 +430,11 @@ class ReviewStore:
             docs = data.get("documents") or {}
             for kind, item in docs.items():
                 if kind in KINDS and isinstance(item, dict) and isinstance(item.get("text"), str):
-                    fields = {k: str(item.get(k) or "") for k in ("generated", "engine", "model", "edited")}
+                    fields = {k: str(item.get(k) or "") for k in ("generated", "engine", "model", "edited", "mode")}
                     heard = [str(name) for name in item.get("transcripts") or []]
                     self.docs[kind] = ReviewDoc(kind, item["text"], **fields, transcripts=heard)
             self.anchors = {str(k): str(v) for k, v in (data.get("anchors") or {}).items()}
+            self.mode = str(data.get("mode") or "") if data.get("mode") in MODES else ""
         except (OSError, ValueError, AttributeError):
             backup = self.path.with_suffix(".json.damaged")
             log.exception("Could not read %s; keeping it as %s", self.path, backup.name)
@@ -429,6 +450,7 @@ class ReviewStore:
             {
                 "documents": {kind: {k: v for k, v in asdict(doc).items() if k != "kind"} for kind, doc in self.docs.items()},
                 "anchors": self.anchors,
+                "mode": self.mode,
             },
         )
 
@@ -444,13 +466,21 @@ class ReviewStore:
         engine: str = "",
         model: str = "",
         transcripts: list[str] | None = None,
+        mode: str = "",
     ) -> ReviewDoc:
         """A newly generated document, replacing the one before (edits and all)."""
-        doc = ReviewDoc(kind, text, generated=_now(), engine=engine, model=model, transcripts=list(transcripts or []))
+        doc = ReviewDoc(
+            kind, text, generated=_now(), engine=engine, model=model, transcripts=list(transcripts or []), mode=mode
+        )
         self.docs[kind] = doc
         self.anchors.update({k: _norm(v) for k, v in anchors.items()})
         self.save()
         return doc
+
+    def set_mode(self, mode: str) -> None:
+        """The reader's choice of mode for this paper; "" leaves it to the PDF."""
+        self.mode = mode if mode in MODES else ""
+        self.save()
 
     def set_text(self, kind: str, text: str) -> bool:
         """The reader's edit. Returns False when nothing changed."""

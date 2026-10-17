@@ -199,6 +199,24 @@ With the lecture's STT registered (§4c.2), all of it goes, each part under the
 page it was matched to; a point taken from the lecture alone starts "(강의)"
 and cites that page.
 
+§4d.4 Two modes, chosen at the top of the pane and kept per paper: 논문 모드
+writes the paper templates above; 강의 모드 writes for the exam. It starts
+as 강의 모드 for slides or anything with its STT, 논문 모드 otherwise. The
+lecture templates ask for what a quiz asks about: each named algorithm or
+mechanism with its rule, conditions, differences, the numbers of worked
+examples; the one-pager ends in "헷갈리기 쉬운 점". What matters is judged by
+the time the professor spent on it and how often they repeated it, measured
+from the STT: each page is marked with how long the lecture stayed there and
+how many times it was put back on screen ("강의 5분 26초 · 6번 띄움"), and the
+longest pages, the most-shown ones and the slide terms said most often are
+listed first. (Measured on OS08: no "important" anywhere in the STT, while
+the longest and most-shown slides, and terms like "reference bit" said forty
+times, were what the quiz asked about.) The professor's earlier quizzes, if
+registered, go along as a guide to the kind of detail asked, not as content. A change to these prompts is judged by how many of the professor's
+quiz questions the result answers, on a lecture the prompt was not written
+against (`quiz_reference/`; OS06: 6.5/12 with the paper template, 11/12 in
+강의 모드; OS08: 8.5/14 and 13/14).
+
 §4d.3 A document is Markdown the reader may edit, in the note's editor, saved
 as it is typed into `review.json`. Its citations are `[p.3](ref:<sentence
 ids>)` links: Ctrl+click follows one while editing, and a sentence's menu puts

@@ -33,7 +33,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 __all__ = [
@@ -43,10 +43,14 @@ __all__ = [
     "align_transcript",
     "combine_transcripts",
     "extract_quiz_examples",
+    "format_duration",
     "format_quiz_examples",
     "parse_transcript",
+    "repeated_terms",
+    "seconds_by_page",
     "transcript_by_page",
     "transcript_excerpt",
+    "visits_by_page",
 ]
 
 #: Caps on what one prompt carries.
@@ -356,12 +360,154 @@ def combine_transcripts(parts: Sequence[Sequence[TranscriptSection]]) -> list[Tr
     return combined
 
 
+def _seconds(stamp: str) -> int | None:
+    """ "01:08:31", "08:31" or "08:31.5" as seconds."""
+    whole = re.split(r"[.,]", stamp.strip())[0]
+    try:
+        numbers = [int(part) for part in whole.split(":")]
+    except ValueError:
+        return None
+    total = 0
+    for number in numbers:
+        total = total * 60 + number
+    return total
+
+
+def seconds_by_page(
+    slides: Sequence[str], sections: Sequence[TranscriptSection], mapping: Mapping[int, list[int]] | None = None
+) -> dict[int, int]:
+    """How long the lecture stayed on each page: ``{page index: seconds}``.
+
+    Where a professor spends nine minutes is where the exam is - a better
+    sign than anything they say (measured on OS08: no "important" or "exam"
+    anywhere, while the slides that took longest were the ones its quiz
+    asked about). Empty when the transcript carries no times. ``mapping`` is
+    :func:`align_transcript`'s answer, when it has been asked already.
+    """
+    out: dict[int, int] = {}
+    mapping = align_transcript(slides, sections) if mapping is None else mapping
+    for page, indices in mapping.items():
+        total = 0
+        for index in indices:
+            start, end = _seconds(sections[index].start), _seconds(sections[index].end)
+            if start is not None and end is not None and end > start:
+                total += end - start
+        if total:
+            out[page] = total
+    return out
+
+
+def visits_by_page(sections: Sequence[TranscriptSection], mapping: Mapping[int, list[int]]) -> dict[int, int]:
+    """How many times each page was put on screen: ``{page index: times}``.
+
+    A recording makes a section each time the screen changes, so a page the
+    professor came back to has a section per return (OS08's most-shown pages,
+    five and six times, were what its quiz asked about). Only a transcript
+    with slide markers says this; one cut into chunks gives ``{}``.
+    """
+    if not any(section.number is not None for section in sections):
+        return {}
+    return {
+        page: shown
+        for page, indices in mapping.items()
+        if (shown := sum(1 for i in indices if sections[i].number is not None))
+    }
+
+
+#: Words that begin or end no term: function words, and the verbs and nouns
+#: any lecture says all the time.
+_COMMON = _STOP | frozenset(
+    """a an as at by if in is it of on or to we us no not do does did has have had its our i he she they
+    be are was were am can cannot must may might will use used uses using call called access accessed
+    accesses load loaded loads first second new old same case cases example examples value values number
+    numbers problem problems operation operations system systems data time times size sizes space process
+    processes way part type make made need needs get gets give show look done other each every all more most
+    less much many some only just very well good high low large small one two three four zero important
+    simple general possible different following based current""".split()
+)
+_TERM_WORD = re.compile(r"[A-Za-z][A-Za-z0-9]*|[가-힣]+")
+
+
+def _term_candidates(text: str, acronyms: set[str]) -> list[str]:
+    """Phrases of two or three words, and the slides' acronyms, in ``text``."""
+    words = [word.lower() for word in _TERM_WORD.findall(text)]
+    out = []
+    for size in (1, 2, 3):
+        for start in range(len(words) - size + 1):
+            gram = words[start : start + size]
+            if gram[0] in _COMMON or gram[-1] in _COMMON or len(gram[0]) < 2 or len(gram[-1]) < 2:
+                continue
+            if size == 1 and gram[0] not in acronyms:
+                continue
+            out.append(" ".join(gram))
+    return out
+
+
+def repeated_terms(
+    slides: Sequence[str],
+    sections: Sequence[TranscriptSection],
+    mapping: Mapping[int, list[int]] | None = None,
+    *,
+    limit: int = 20,
+) -> list[tuple[str, int, int]]:
+    """The slides' terms the professor kept saying, most first: (term, times
+    said, pages it was said over).
+
+    A term is a phrase of two or three words on the slides ("reference bit",
+    "history register") or an acronym never written in lower case there
+    ("LRU"). Single ordinary words were too noisy to count - "accessed",
+    "must" and "example" topped the list. A term on a quarter of the slides
+    or more is the subject itself and says nothing; the rest are weighed by
+    how few slides carry them, as a search engine weighs a rare word.
+    """
+    mapping = align_transcript(slides, sections) if mapping is None else mapping
+    page_of = {i: page for page, indices in mapping.items() for i in indices}
+    upper: Counter[str] = Counter()
+    lower: Counter[str] = Counter()
+    for page in slides:
+        for word in _TERM_WORD.findall(page):
+            (upper if word.isupper() and 2 <= len(word) <= 6 else lower)[word.lower()] += 1
+    acronyms = {word for word in upper if word not in lower}
+    on_slides: Counter[str] = Counter()
+    for page in slides:
+        on_slides.update(set(_term_candidates(page, acronyms)))
+    said: Counter[str] = Counter()
+    pages: dict[str, set[int]] = {}
+    for index, section in enumerate(sections):
+        for term in _term_candidates(section.text, acronyms):
+            if 0 < on_slides[term] <= len(slides) / 4:
+                said[term] += 1
+                if index in page_of:
+                    pages.setdefault(term, set()).add(page_of[index])
+    weight = {term: n * math.log(len(slides) / on_slides[term]) for term, n in said.items() if n >= 4}
+    ranked = sorted(weight, key=lambda term: (-weight[term], term))
+    # "reference bit" said forty times makes "reference bits" no news.
+    kept = [
+        term for term in ranked
+        if not any(other != term and f" {term} " in f" {other} " and said[other] >= 0.6 * said[term]
+                   for other in ranked[:80])
+    ]
+    return [
+        (term.upper() if term in acronyms else term, said[term], len(pages.get(term, ())))
+        for term in kept[:limit]
+    ]
+
+
+def format_duration(seconds: int) -> str:
+    """ "9분 17초", "45초"."""
+    minutes, rest = divmod(max(0, int(seconds)), 60)
+    return f"{minutes}분 {rest}초" if minutes else f"{rest}초"
+
+
 #: The STT a review of the whole lecture carries, at most.
 REVIEW_TRANSCRIPT_CHARS = 200_000
 
 
 def transcript_by_page(
-    slides: Sequence[str], sections: Sequence[TranscriptSection], budget: int = REVIEW_TRANSCRIPT_CHARS
+    slides: Sequence[str],
+    sections: Sequence[TranscriptSection],
+    budget: int = REVIEW_TRANSCRIPT_CHARS,
+    mapping: Mapping[int, list[int]] | None = None,
 ) -> dict[int, str]:
     """All of the STT, each part under the page it explains: ``{page index: text}``.
 
@@ -369,7 +515,7 @@ def transcript_by_page(
     section is placed somewhere, and a lecture that says more than ``budget``
     characters has each page's share cut in proportion.
     """
-    mapping = align_transcript(slides, sections)
+    mapping = align_transcript(slides, sections) if mapping is None else mapping
     total = sum(len(sections[i].text) for indices in mapping.values() for i in indices)
     scale = min(1.0, budget / total) if total else 1.0
     out: dict[int, str] = {}
