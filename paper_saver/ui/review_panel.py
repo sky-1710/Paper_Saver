@@ -43,6 +43,7 @@ from ..core.review import KINDS, MODES, ReviewDoc, ReviewStore, plain_citations
 from ..pdf.text import MATERIAL_SUFFIXES
 from ..render.review import LINK_STYLE, review_html
 from .live_markdown import LiveMarkdownEdit
+from .quiz_panel import LectureChoice, fill_lecture_menu
 
 __all__ = ["ReviewPanel"]
 
@@ -87,6 +88,8 @@ class ReviewPanel(QWidget):
     transcriptsChosen = Signal(list)
     transcriptRemoved = Signal(str)
     transcriptMoved = Signal(str, int)
+    #: Read the STT from these Lecture Saver projects (their folders).
+    lecturesLinked = Signal(list)
     #: The reader's edit of a document was saved: its kind. Another panel
     #: showing the same document draws it again.
     documentChanged = Signal(str)
@@ -99,12 +102,15 @@ class ReviewPanel(QWidget):
         parent: QWidget | None = None,
         *,
         transcripts: Callable[[], list[tuple[str, str]]] | None = None,
+        lectures: Callable[[], list[LectureChoice]] | None = None,
         default_mode: Callable[[], str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.store = store
-        #: The registered STT files as (name, file), in lecture order.
+        #: The registered STT as (name, key), in lecture order.
         self._transcripts = transcripts or (lambda: [])
+        #: Lecture Saver's recordings, as the quiz tab offers them.
+        self._lectures = lectures or (lambda: [])
         #: The mode until the reader chooses one: what the PDF looks like.
         self._default_mode = default_mode or (lambda: "paper")
         #: Told the kind just before this panel starts editing it, so another
@@ -347,7 +353,11 @@ class ReviewPanel(QWidget):
             item.addSeparator()
             item.addAction("빼기…", lambda f=file, n=name: self._remove_transcript(f, n))
         menu.addSeparator()
-        menu.addAction("STT 추가… (PDF·txt·md·srt·vtt, 여러 개 가능)", self._choose_transcripts)
+        fill_lecture_menu(
+            menu.addMenu("Lecture Saver에서 연결"), self._lectures(), self.lecturesLinked.emit,
+            self.transcriptRemoved.emit,
+        )
+        menu.addAction("STT 파일 추가… (PDF·txt·md·srt·vtt, 여러 개 가능)", self._choose_transcripts)
         menu.addAction("퀴즈 탭과 같은 목록입니다").setEnabled(False)
 
     def _choose_transcripts(self) -> None:

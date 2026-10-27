@@ -197,6 +197,152 @@ def test_import_is_all_or_nothing(tmp_path: Path) -> None:
     assert store.quizzes == {}
 
 
+# -- linked materials: Lecture Saver and the style library ------------------------------
+
+
+def _lecture_saver_project(folder: Path, name: str = "OS08-PageReplacement-1") -> Path:
+    """A Lecture Saver project as it lies on disk: slide 2 shown twice."""
+    root = folder / name
+    root.mkdir(parents=True)
+    (root / "project.json").write_text(json.dumps({"name": name, "updated_at": "2026-10-14"}), "utf-8")
+    segments = [
+        {"id": "s1", "start": 1.0, "end": 5.0, "original_text": "today page replacement", "edited_text": None},
+        {"id": "s2", "start": 12.0, "end": 20.0, "original_text": "the the referense bit", "edited_text": "the reference bit"},
+        {"id": "s3", "start": 21.0, "end": 22.0, "original_text": "um", "edited_text": ""},
+        {"id": "s4", "start": 41.0, "end": 47.0, "original_text": "back to the reference bit", "edited_text": None},
+    ]
+    (root / "transcript.json").write_text(json.dumps({"schema_version": 1, "segments": segments}), "utf-8")
+    shown = [(1, 1, 0.0, 10.0), (2, 2, 10.0, 30.0), (3, 3, 30.0, 40.0), (4, 2, 40.0, 50.0)]
+    appearances = [{"appearance_id": a, "slide_id": s, "start": b, "end": e} for a, s, b, e in shown]
+    (root / "slides.json").write_text(json.dumps({"slides": [], "appearances": appearances}), "utf-8")
+    return root
+
+
+def test_a_lecture_saver_project_reads_as_its_markdown_export(tmp_path: Path) -> None:
+    from paper_saver.core.lecture import parse_transcript, visits_by_page
+    from paper_saver.core.lecture_saver import find_projects, same_lecture, transcript_markdown
+
+    root = _lecture_saver_project(tmp_path / "Projects")
+    _lecture_saver_project(tmp_path / "Projects", "OS08-PageReplacement-2")
+    (tmp_path / "Projects" / "not a lecture").mkdir()
+    found = find_projects([tmp_path / "Projects", root, tmp_path / "missing"])
+    assert [p.name for p in found] == ["OS08-PageReplacement-1", "OS08-PageReplacement-2"]
+
+    sections = parse_transcript(transcript_markdown(root))
+    assert [(s.number, s.same_as, s.span) for s in sections] == [
+        (1, None, "00:00:00–00:00:10"), (2, None, "00:00:10–00:00:30"),
+        (3, None, "00:00:30–00:00:40"), (4, 2, "00:00:40–00:00:50"),
+    ]
+    # The reader's edits are what is read; a line blanked there is gone.
+    assert [s.text for s in sections] == ["today page replacement", "the reference bit", "", "back to the reference bit"]
+    assert visits_by_page(sections, {0: [0], 1: [1, 3], 2: [2]})[1] == 2
+
+    assert same_lecture("OS08-PageReplacement.pdf", "OS08-PageReplacement-2")
+    assert same_lecture("OS02-LimitedDirectExecution (1).pdf", "OS02-LimitedDirectExecution")
+    assert same_lecture("3_EDA.pdf", "3_EDA_statistics")
+    assert not same_lecture("OS07-Paging.pdf", "OS08-PageReplacement-1")
+    assert not same_lecture("3.pdf", "3_EDA_statistics")  # too short to say
+
+
+def test_a_linked_recording_follows_lecture_saver_and_outlives_it(tmp_path: Path) -> None:
+    from paper_saver.core.lecture_saver import find_projects, transcript_markdown
+    from paper_saver.core.quiz import QuizStore
+
+    root = _lecture_saver_project(tmp_path / "Projects")
+    project = find_projects([root])[0]
+    store = QuizStore(tmp_path / "paper")
+    material = store.link_lecture(project, transcript_markdown(root))
+    assert store.link_lecture(project, "") is material and len(store.transcripts) == 1
+    assert "the reference bit" in store.transcript_parts()[0][1]
+
+    # Corrected in Lecture Saver: read that way here, after a reopen too.
+    data = json.loads((root / "transcript.json").read_text("utf-8"))
+    data["segments"][0]["edited_text"] = "today, page replacement policies"
+    (root / "transcript.json").write_text(json.dumps(data), "utf-8")
+    again = QuizStore(tmp_path / "paper")
+    assert again.transcripts[0].lecture == str(root.resolve())
+    assert "page replacement policies" in again.transcript_parts()[0][1]
+
+    # Moved away: the text read last is still there.
+    root.rename(tmp_path / "moved")
+    assert "page replacement policies" in again.transcript_parts()[0][1]
+    again.remove_transcript(material.key)
+    assert again.transcripts == [] and (tmp_path / "paper").is_dir()
+    assert not (tmp_path / "paper" / material.text).exists()
+
+
+def test_the_style_library_links_files_and_course_folders(tmp_path: Path) -> None:
+    from paper_saver.core.quiz import QuizStore, StyleEntry, StyleLibrary
+
+    library = StyleLibrary(tmp_path / "Quiz Styles", (".pdf", ".md", ".txt"))
+    assert library.entries() == []
+    course = tmp_path / "Quiz Styles" / "운영체제"
+    course.mkdir(parents=True)
+    for name in ("OS10-Quiz.md", "OS2-Quiz.md", "~$lock.md", "notes.docx"):
+        (course / name).write_text(f"1. {name} (O)", "utf-8")
+    picked = tmp_path / "Downloads" / "OS2-Quiz.md"
+    picked.parent.mkdir()
+    picked.write_text("1. loose (X)", "utf-8")
+
+    assert library.add(picked) == "OS2-Quiz.md"
+    assert library.add(picked) == "OS2-Quiz (2).md"  # a second copy, not an overwrite
+    assert library.add(course / "OS10-Quiz.md") == "운영체제/OS10-Quiz.md"  # already there: linked in place
+    assert library.entries() == [
+        StyleEntry("운영체제", True, 2), StyleEntry("OS2-Quiz (2).md", False, 1), StyleEntry("OS2-Quiz.md", False, 1),
+    ]
+    assert [p.name for p in library.files("운영체제")] == ["OS2-Quiz.md", "OS10-Quiz.md"]
+    assert library.files("gone") == []
+
+    store = QuizStore(tmp_path / "paper")
+    store.link_style("운영체제")
+    store.link_style("OS2-Quiz (2).md")
+    store.link_style("운영체제")
+    assert QuizStore(tmp_path / "paper").style_links == ["운영체제", "OS2-Quiz (2).md"]
+    # Put in the folder later: taken too. Named like a copy the lecture holds: read once.
+    (course / "OS11-Quiz.md").write_text("1. later (O)", "utf-8")
+    text = library.text(store.style_links, lambda p: p.read_text("utf-8").upper(), skip=["OS10-Quiz.md"])
+    assert [line for line in text.splitlines() if line.startswith("# ")] == [
+        "# OS2-Quiz.md", "# OS11-Quiz.md", "# OS2-Quiz (2).md",
+    ]
+    assert "1. LATER (O)" in text
+    store.unlink_style("운영체제")
+    assert QuizStore(tmp_path / "paper").style_links == ["OS2-Quiz (2).md"]
+
+
+def test_panel_offers_the_recordings_and_ticks_the_library(qapp, tmp_path: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    from paper_saver.core.lecture_saver import find_projects
+    from paper_saver.core.quiz import QuizStore, StyleLibrary
+    from paper_saver.ui.quiz_panel import QuizPanel
+
+    projects = find_projects([_lecture_saver_project(tmp_path / "Projects"), _lecture_saver_project(tmp_path / "x", "Other")])
+    (tmp_path / "Quiz Styles" / "운영체제").mkdir(parents=True)
+    (tmp_path / "Quiz Styles" / "운영체제" / "OS2-Quiz.md").write_text("1. a (O)", "utf-8")
+    store = QuizStore(tmp_path / "paper")
+    panel = QuizPanel(store, 5, "OS08-PageReplacement.pdf", tmp_path, library=StyleLibrary(tmp_path / "Quiz Styles", (".md",)))
+    assert not panel.lecture_offer.isVisibleTo(panel)
+
+    panel.set_lectures(projects, [projects[0].key])
+    assert panel.lecture_offer.isVisibleTo(panel)
+    assert "OS08-PageReplacement-1" in panel.lecture_offer_label.text()
+    assert [(p.name, near, linked) for p, near, linked in panel.lecture_choices()] == [
+        ("OS08-PageReplacement-1", True, False), ("Other", False, False),
+    ]
+    linked: list[list] = []
+    panel.lecturesLinked.connect(linked.append)
+    panel._fill_lecture_menu()
+    menu = [a for a in panel._lecture_menu.actions() if a.isCheckable()]
+    menu[0].trigger()
+    assert linked == [[projects[0].key]]
+
+    item = panel.style_list.item(0)
+    assert item.text() == "📁 운영체제 — 1개"
+    item.setCheckState(Qt.CheckState.Checked)
+    assert store.style_links == ["운영체제"]
+    _wait(qapp, lambda: "스타일 참고 1개" in panel.materials_summary.text())
+
+
 # -- lecture text ---------------------------------------------------------------------
 
 LECTURE_MD = """# OS06-Memory
@@ -463,6 +609,51 @@ def test_reader_generates_a_quiz_for_the_slide_in_view(qapp, tmp_path: Path, two
     beside = tmp_path / "exports" / "slides.pdf"
     reader.export_quiz_pdf(str(beside), "right")
     _wait(qapp, lambda: beside.is_file() and not reader.quiz_panel._pdf_busy)
+    window.close()
+
+
+def test_reader_links_the_recording_and_the_course_quizzes(qapp, tmp_path: Path, two_column_pdf: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    from PySide6.QtCore import Qt
+
+    from paper_saver.config import Settings
+    from paper_saver.ui.main_window import MainWindow, _prepare
+
+    recording = _lecture_saver_project(tmp_path / "Lecture Saver", "synthetic-1")
+    data = json.loads((recording / "transcript.json").read_text("utf-8"))
+    data["segments"][0]["edited_text"] = "graph neural networks on the SEED dataset, as said in the lecture"
+    (recording / "transcript.json").write_text(json.dumps(data), "utf-8")
+    course = tmp_path / "Quiz Styles" / "운영체제"
+    course.mkdir(parents=True)
+    (course / "OS02-Quiz.md").write_text("1. The kernel runs in user mode. (X)\n해설: kernel mode입니다.", "utf-8")
+
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("lecture_saver_dir", str(tmp_path / "Lecture Saver"))
+    settings.set("auto_translate", False)
+    window = MainWindow(settings)
+    project, layout = _prepare(two_column_pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    window._opened((project, layout))
+    reader = window.reader
+    panel = reader.quiz_panel
+    assert panel.library.root == tmp_path / "Quiz Styles"
+
+    # Named like the PDF: offered, and linked with one press.
+    _wait(qapp, lambda: panel.lecture_offer.isVisibleTo(panel))
+    panel.lecturesLinked.emit(list(panel._suggested))
+    _wait(qapp, lambda: bool(reader.quiz_store.transcripts))
+    assert reader.quiz_store.transcripts[0].lecture == str(recording.resolve())
+    assert "Lecture Saver STT 연결: synthetic-1" in panel.materials_status.text()
+    assert not panel.lecture_offer.isVisibleTo(panel)
+    assert reader.review_panels["left"].stt_button.text() == "🎙 STT 1개"
+    panel.style_list.item(0).setCheckState(Qt.CheckState.Checked)
+
+    engine = FakeEngine([json.dumps(_quiz_dict(slide=1))])
+    reader._engine_provider = lambda: engine
+    reader.generate_quiz(1)
+    _wait(qapp, lambda: reader.quiz_store.get(1) is not None)
+    assert "as said in the lecture" in engine.prompts[0]
+    assert "The kernel runs in user mode" in engine.prompts[0]
     window.close()
 
 

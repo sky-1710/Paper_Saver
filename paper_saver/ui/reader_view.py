@@ -71,14 +71,21 @@ from ..core.lecture import (
     parse_transcript,
     transcript_excerpt,
 )
+from ..core.lecture_saver import (
+    LectureProject,
+    LectureSaverError,
+    find_projects,
+    same_lecture,
+    transcript_markdown,
+)
 from ..core.notebook import IMAGE_SUFFIXES
 from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
 from ..core.project import HIGHLIGHT_COLORS, Project, WordEntry
-from ..core.quiz import QuizStore, id_prefix
+from ..core.quiz import QuizStore, StyleLibrary, id_prefix
 from ..core.review import KINDS as REVIEW_KINDS
 from ..core.review import ReviewStore, plain_citations, refs_in
 from ..pdf.document import PaperDocument
-from ..pdf.text import MaterialError, read_pages, read_paper, stray_lines
+from ..pdf.text import MATERIAL_SUFFIXES, MaterialError, read_pages, read_paper, stray_lines
 from ..render.quiz_pdf import PLACEMENTS, quiz_pdf, slides_quiz_pdf
 from ..translate.codex_cli import forget_codex_session
 from ..translate.dictionary import Dictionary, clean_word
@@ -276,11 +283,13 @@ class ReaderView(QWidget):
         self._attach_task: BackgroundTask | None = None
         self.note_panel = NotePanel(project, settings)
         self.quiz_store = QuizStore(project.root)
+        self.style_library = StyleLibrary(settings.quiz_styles_dir, MATERIAL_SUFFIXES)
         self.quiz_panel = QuizPanel(
             self.quiz_store, session.page_count,
             Path(str(project.meta.get("source") or project.pdf_path)).name,
-            project.exports_dir, project.title,
+            project.exports_dir, project.title, library=self.style_library,
         )
+        self._lecture_task: BackgroundTask | None = None
         self._deck: SlideDeck | None = None
         self._deck_task: BackgroundTask | None = None
         self._quiz_task: BackgroundTask | None = None
@@ -291,8 +300,8 @@ class ReaderView(QWidget):
         # One per pane, over the same documents.
         self.review_panels = {
             side: ReviewPanel(
-                self.review_store, transcripts=lambda: [(m.name, m.file) for m in self.quiz_store.transcripts],
-                default_mode=self._default_review_mode,
+                self.review_store, transcripts=lambda: [(m.name, m.key) for m in self.quiz_store.transcripts],
+                lectures=self.quiz_panel.lecture_choices, default_mode=self._default_review_mode,
             )
             for side in SIDES
         }
@@ -444,7 +453,10 @@ class ReaderView(QWidget):
             panel.transcriptsChosen.connect(self._register_transcripts)
             panel.transcriptRemoved.connect(self._remove_transcript)
             panel.transcriptMoved.connect(self._move_transcript)
+            panel.lecturesLinked.connect(self._link_lectures)
+        self.quiz_panel.lecturesRescan.connect(self._find_lectures)
         self.quiz_panel.stylesChosen.connect(self._register_styles)
+        self._find_lectures()
         self.quiz_panel.pdfExportRequested.connect(self.export_quiz_pdf)
         for side, panel in self.review_panels.items():
             other = self.review_panels[_other(side)]
@@ -1446,11 +1458,12 @@ class ReaderView(QWidget):
             return
         project, store = self.session.project, self.quiz_store
         pdf, deck = project.pdf_path, self._deck
-        transcripts, styles = store.transcript_parts(), store.style_text()
+        transcripts, read_styles = store.transcript_parts(), self._style_reader()
         image_path = store.root / QuizStore.FOLDER / "slides" / f"slide-{slide}.png" if store.send_slide_image else None
         prefix, lecture = id_prefix(project.title), project.title
 
         def work(cancel, _report):  # type: ignore[no-untyped-def]
+            styles = read_styles()
             slides = deck or SlideDeck(read_pages(pdf))
             page = slide - 1
             content = slides.content(page)
@@ -1597,35 +1610,98 @@ class ReaderView(QWidget):
             panel.refresh()
 
     def _register_styles(self, paths: list) -> None:
+        """Read the professor's earlier quizzes, put them in the style
+        library (once, for every lecture) and link them to this one."""
         if self._material_running():
             return
-        store = self.quiz_store
+        store, library = self.quiz_store, self.style_library
 
         def work(_cancel, _report):  # type: ignore[no-untyped-def]
             added = []
             for path in paths:
                 source = Path(path)
-                pages = read_pages(source)
-                examples = extract_quiz_examples(pages)
-                text = format_quiz_examples(examples, fallback="\n".join(pages))
+                text, count = _style_examples(source)
                 if not text.strip():
                     raise MaterialError(f"'{source.name}'에서 텍스트를 찾지 못했습니다.")
-                added.append((store.import_material(source, text), len(examples)))
+                added.append((library.add(source), count))
             return added
 
         def finished(added) -> None:  # type: ignore[no-untyped-def]
-            for material, _count in added:
-                store.add_style(material)
-            summary = ", ".join(f"{m.name} (문제 {n}개 인식)" if n else f"{m.name} (문항 형식 없음 · 본문 일부 사용)" for m, n in added)
+            for link, _count in added:
+                store.link_style(link)
+            summary = ", ".join(f"{link} (문제 {n}개 인식)" if n else f"{link} (문항 형식 없음 · 본문 일부 사용)" for link, n in added)
             if not self._closed:
-                self.quiz_panel.set_material_busy(False, f"스타일 참고 추가: {summary}")
+                self.quiz_panel.set_material_busy(False, f"스타일 참고 추가: {summary} — 퀴즈 스타일 폴더에 넣었습니다")
 
         self._run_material(work, finished, "이전 퀴즈를 읽는 중…")
+
+    def _style_reader(self) -> Callable[[], str]:
+        """The style references as they stand now, to be read in a worker:
+        the copied ones, then every file the library links reach."""
+        store, library = self.quiz_store, self.style_library
+        copied, links, skip = store.style_text(), list(store.style_links), [m.name for m in store.styles]
+
+        def read() -> str:
+            linked = library.text(links, lambda path: _style_examples(path)[0], skip) if links else ""
+            return "\n\n".join(part for part in (copied, linked) if part)
+
+        return read
+
+    # -- Lecture Saver ------------------------------------------------------------------
+
+    def _find_lectures(self) -> None:
+        """What Lecture Saver holds, and which recordings are named like this PDF."""
+        if self._lecture_task is not None and self._lecture_task.running:
+            return
+        places = self.settings.lecture_saver_places()
+        project = self.session.project
+        name = Path(str(project.meta.get("source") or project.pdf_path)).name
+
+        def work(_cancel, _report):  # type: ignore[no-untyped-def]
+            found = find_projects(places)
+            return found, [p.key for p in found if same_lecture(name, p.name)]
+
+        def finished(result) -> None:  # type: ignore[no-untyped-def]
+            if not self._closed:
+                self.quiz_panel.set_lectures(*result)
+
+        task = BackgroundTask(work, name="lecture-saver")
+        task.succeeded.connect(finished)
+        task.failed.connect(lambda exc: log.warning("Could not look through Lecture Saver: %s", exc))
+        self._lecture_task = task.start()
+
+    def _link_lectures(self, keys: list) -> None:
+        """Read the STT from Lecture Saver projects from now on, after what is there."""
+        if self._material_running():
+            self.statusMessage.emit("앞의 자료를 읽는 중입니다. 잠시 후 다시 시도하세요.")
+            return
+        store = self.quiz_store
+        known = {p.key: p for p in self.quiz_panel.lectures}
+        projects = [known.get(key) or LectureProject(Path(key), Path(key).name) for key in keys]
+
+        def work(_cancel, _report):  # type: ignore[no-untyped-def]
+            return [(project, transcript_markdown(project.root)) for project in projects]
+
+        def finished(read) -> None:  # type: ignore[no-untyped-def]
+            found = []
+            for project, text in read:
+                store.link_lecture(project, text)
+                sections = parse_transcript(text)
+                slides = sum(1 for s in sections if s.number is not None)
+                found.append(f"{project.name} — " + (f"슬라이드 {slides}개 구간" if slides else f"{len(sections)}개 구간"))
+            if not self._closed:
+                message = "Lecture Saver STT 연결: " + " / ".join(found)
+                self.quiz_panel.set_material_busy(False, message)
+                for panel in self.review_panels.values():
+                    panel.refresh()
+                self.statusMessage.emit(message)
+
+        self._run_material(work, finished, f"Lecture Saver에서 STT {len(projects)}개를 읽는 중…")
 
     def _run_material(self, work, finished, message: str) -> None:  # type: ignore[no-untyped-def]
         def failed(exc: Exception) -> None:
             if not self._closed:
-                text = str(exc) if isinstance(exc, MaterialError) else f"자료를 읽지 못했습니다: {exc}"
+                text = str(exc) if isinstance(exc, (MaterialError, LectureSaverError)) else f"자료를 읽지 못했습니다: {exc}"
                 self.quiz_panel.set_material_busy(False, text)
                 self.statusMessage.emit(text.split("\n")[0])
 
@@ -1703,11 +1779,12 @@ class ReaderView(QWidget):
         pdf, deck = self.session.project.pdf_path, self._deck
         transcripts = self.quiz_store.transcript_parts()
         names = tuple(name for name, _ in transcripts)
-        styles = self.quiz_store.style_text()
+        read_styles = self._style_reader()
         mode = self.review_panels["left"].mode
         lecture = mode == "lecture"
 
         def work(cancel, _report):  # type: ignore[no-untyped-def]
+            styles = read_styles()
             try:
                 strays = stray_lines(pdf, layout)
             except Exception:  # pymupdf raises several unrelated types
@@ -1821,6 +1898,14 @@ def _swatch(color: str) -> QIcon:
     pixmap = QPixmap(14, 14)
     pixmap.fill(QColor(color))
     return QIcon(pixmap)
+
+
+def _style_examples(path: Path) -> tuple[str, int]:
+    """A professor's earlier quiz as the examples a prompt carries, and how
+    many questions were recognised in it."""
+    pages = read_pages(path)
+    examples = extract_quiz_examples(pages)
+    return format_quiz_examples(examples, fallback="\n".join(pages)), len(examples)
 
 
 def _plain(text: str) -> str:

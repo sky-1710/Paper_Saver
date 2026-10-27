@@ -3,8 +3,15 @@
 Everything lives in the project folder::
 
     <project>/quiz.json                 quizzes by slide, answers, material list
-    <project>/quiz/materials/           the STT and the style references, copied in,
+    <project>/quiz/materials/           the STT files and style references copied in,
                                         each with its extracted text beside it
+
+except what is linked rather than copied. A Lecture Saver recording is read
+from its own project every time (:mod:`.lecture_saver`), so an edit made there
+shows here; a copy of its text is kept in ``quiz/materials/`` in case the
+project moves. The professor's earlier quizzes are kept once, in a folder of
+their own (:class:`StyleLibrary`), and each lecture names the files or the
+course folders it takes from there.
 
 The STT is the lecture's, not the quiz's: a professor who records a lecture in
 parts leaves several files, kept in lecture order, and the one-page review and
@@ -35,12 +42,14 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .atomic_io import read_json, write_json_atomic, write_text_atomic
+from .lecture_saver import LectureProject, LectureSaverError, transcript_markdown
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +61,8 @@ __all__ = [
     "QuizQuestion",
     "QuizStore",
     "SlideQuiz",
+    "StyleEntry",
+    "StyleLibrary",
     "id_prefix",
     "slide_quiz_from_dict",
 ]
@@ -238,15 +249,24 @@ class QuizAttempt:
 
 @dataclass
 class Material:
-    """A file the reader registered, copied into the project."""
+    """A file the reader registered, copied into the project - or a Lecture
+    Saver recording, linked."""
 
     #: The name it had where the reader picked it.
     name: str
-    #: The copy, relative to the project.
+    #: The copy, relative to the project; "" for a linked recording.
     file: str
-    #: The text taken from it, relative to the project.
+    #: The text taken from it, relative to the project. For a linked
+    #: recording, the text read last, used when the project cannot be.
     text: str
     added: str = field(default_factory=_now)
+    #: The Lecture Saver project folder it is read from, if linked.
+    lecture: str = ""
+
+    @property
+    def key(self) -> str:
+        """What names it in the list: its copy, or the project it is read from."""
+        return self.lecture or self.file
 
 
 def _safe_name(name: str) -> str:
@@ -263,7 +283,10 @@ class QuizStore:
         self.path = self.root / self.FILE
         #: The lecture's STT, one file per recording, in lecture order.
         self.transcripts: list[Material] = []
+        #: Style references copied in, before there was a library to link from.
         self.styles: list[Material] = []
+        #: Files and folders of the style library, relative to it.
+        self.style_links: list[str] = []
         #: Send the slide's picture along, so figures can be asked about.
         self.send_slide_image = False
         self.quizzes: dict[int, SlideQuiz] = {}
@@ -293,6 +316,7 @@ class QuizStore:
             self.styles = [Material(**m) for m in materials.get("styles") or []]
         except TypeError:
             log.warning("Quiz materials list is malformed; ignoring it")
+        self.style_links = [str(link) for link in materials.get("styleLinks") or [] if link]
         self.send_slide_image = bool(data.get("sendSlideImage", False))
         for item in data.get("quizzes") or []:
             try:
@@ -314,6 +338,7 @@ class QuizStore:
                 "materials": {
                     "transcripts": [m.__dict__ for m in self.transcripts],
                     "styles": [m.__dict__ for m in self.styles],
+                    "styleLinks": self.style_links,
                 },
                 "sendSlideImage": self.send_slide_image,
                 "quizzes": [self.quizzes[n].to_dict() for n in sorted(self.quizzes)],
@@ -356,6 +381,8 @@ class QuizStore:
 
     def _discard(self, material: Material) -> None:
         for relative in (material.file, material.text):
+            if not relative:
+                continue
             try:
                 (self.root / relative).unlink(missing_ok=True)
             except OSError:
@@ -366,15 +393,35 @@ class QuizStore:
         self.transcripts.append(material)
         self.save()
 
-    def remove_transcript(self, file: str) -> None:
-        for material in [m for m in self.transcripts if m.file == file]:
+    def link_lecture(self, project: LectureProject, text: str) -> Material:
+        """Read the STT from a Lecture Saver project from now on, after the
+        ones already there. ``text`` is what it holds now, kept as the copy."""
+        existing = next((m for m in self.transcripts if m.lecture == project.key), None)
+        if existing is not None:
+            return existing
+        folder = self.materials_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        base = _safe_name(project.name) + ".lecture"
+        target, counter = folder / f"{base}.md", 2
+        while target.exists():
+            target = folder / f"{base} ({counter}).md"
+            counter += 1
+        write_text_atomic(target, text)
+        material = Material(
+            name=project.name, file="", text=target.relative_to(self.root).as_posix(), lecture=project.key
+        )
+        self.add_transcript(material)
+        return material
+
+    def remove_transcript(self, key: str) -> None:
+        for material in [m for m in self.transcripts if m.key == key]:
             self._discard(material)
-        self.transcripts = [m for m in self.transcripts if m.file != file]
+        self.transcripts = [m for m in self.transcripts if m.key != key]
         self.save()
 
-    def move_transcript(self, file: str, step: int) -> None:
+    def move_transcript(self, key: str, step: int) -> None:
         """Earlier (-1) or later (+1) in the lecture."""
-        index = next((i for i, m in enumerate(self.transcripts) if m.file == file), None)
+        index = next((i for i, m in enumerate(self.transcripts) if m.key == key), None)
         if index is None or not 0 <= index + step < len(self.transcripts):
             return
         items = self.transcripts
@@ -392,11 +439,35 @@ class QuizStore:
         self.styles = [m for m in self.styles if m.file != file]
         self.save()
 
+    def link_style(self, link: str) -> None:
+        """Take a file or a folder of the style library into this lecture's quizzes."""
+        if link not in self.style_links:
+            self.style_links.append(link)
+            self.save()
+
+    def unlink_style(self, link: str) -> None:
+        if link in self.style_links:
+            self.style_links.remove(link)
+            self.save()
+
     def _read_text(self, material: Material | None) -> str:
         if material is None:
             return ""
+        copy = self.root / material.text
+        if material.lecture:
+            try:
+                text = transcript_markdown(Path(material.lecture))
+            except LectureSaverError:
+                log.warning("Lecture Saver project unreadable, using the copy: %s", material.lecture, exc_info=True)
+            else:
+                try:
+                    if not copy.is_file() or copy.read_text(encoding="utf-8") != text:
+                        write_text_atomic(copy, text)
+                except OSError:
+                    log.warning("Could not keep a copy of %s", material.lecture, exc_info=True)
+                return text
         try:
-            return (self.root / material.text).read_text(encoding="utf-8")
+            return copy.read_text(encoding="utf-8")
         except OSError:
             log.warning("Material text missing: %s", material.text)
             return ""
@@ -406,7 +477,8 @@ class QuizStore:
         return [(m.name, text) for m in self.transcripts if (text := self._read_text(m)).strip()]
 
     def style_text(self) -> str:
-        """Every reference's examples, each under the name of its file."""
+        """Every copied reference's examples, each under the name of its file.
+        The linked ones are read by :meth:`StyleLibrary.text`."""
         parts = []
         for material in self.styles:
             text = self._read_text(material).strip()
@@ -475,6 +547,104 @@ class QuizStore:
             self.attempts[quiz.slide] = QuizAttempt()
         self.save()
         return len(quizzes)
+
+
+# -- the style library ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StyleEntry:
+    """A file or a folder at the top of the style library."""
+
+    #: Relative to the library, "/"-separated: what a lecture links to.
+    link: str
+    folder: bool
+    #: The files it holds: 1 for a file.
+    count: int
+
+
+def _natural(name: str) -> list[Any]:
+    """"OS2" before "OS10"."""
+    return [int(piece) if piece.isdigit() else piece for piece in re.split(r"(\d+)", name.lower())]
+
+
+class StyleLibrary:
+    """The professor's earlier quizzes, kept once and linked from each lecture.
+
+    A plain folder the reader may fill and arrange in the file browser too.
+    A lecture links a file, or a folder - a course - and so takes every file
+    in it, those put there later as well. Nothing is extracted ahead: the
+    files are read when a quiz or a review is asked for, in its worker, so a
+    file replaced in the folder is read as it now is.
+    """
+
+    def __init__(self, root: Path, suffixes: Sequence[str]) -> None:
+        self.root = Path(root)
+        self.suffixes = tuple(s.lower() for s in suffixes)
+
+    def _material(self, path: Path) -> bool:
+        return path.suffix.lower() in self.suffixes and not path.name.startswith((".", "~$")) and path.is_file()
+
+    def _files_in(self, folder: Path) -> list[Path]:
+        try:
+            found = [p for p in folder.rglob("*") if self._material(p)]
+        except OSError:
+            return []
+        return sorted(found, key=lambda p: _natural(p.relative_to(folder).as_posix()))
+
+    def entries(self) -> list[StyleEntry]:
+        """Folders first, then loose files, each by name."""
+        try:
+            items = sorted(self.root.iterdir(), key=lambda p: _natural(p.name)) if self.root.is_dir() else []
+        except OSError:
+            items = []
+        folders = [StyleEntry(p.name, True, len(self._files_in(p))) for p in items if p.is_dir() and p.name[0] != "."]
+        return folders + [StyleEntry(p.name, False, 1) for p in items if self._material(p)]
+
+    def files(self, link: str) -> list[Path]:
+        """What a link stands for now; nothing if it is gone."""
+        path = self.root / link
+        if path.is_dir():
+            return self._files_in(path)
+        return [path] if self._material(path) else []
+
+    def add(self, source: Path) -> str:
+        """Copy a file to the top of the library, under a name of its own, and
+        return its link. A file already in the library is linked where it is."""
+        source = Path(source)
+        try:
+            return source.resolve().relative_to(self.root.resolve()).as_posix()
+        except ValueError:
+            pass
+        self.root.mkdir(parents=True, exist_ok=True)
+        base = _safe_name(source.name)
+        target, counter = self.root / base, 2
+        while target.exists():
+            target = self.root / f"{Path(base).stem} ({counter}){Path(base).suffix}"
+            counter += 1
+        shutil.copy2(source, target)
+        return target.name
+
+    def text(self, links: Sequence[str], read: Callable[[Path], str], skip: Sequence[str] = ()) -> str:
+        """Every linked file's examples under its name, as
+        :meth:`QuizStore.style_text` gives the copied ones. A file named in
+        ``skip`` (copied into the lecture already) or reached twice is read
+        once; one that cannot be read is passed over."""
+        seen = set(skip)
+        parts = []
+        for link in links:
+            for path in self.files(link):
+                if path.name in seen:
+                    continue
+                seen.add(path.name)
+                try:
+                    text = read(path).strip()
+                except Exception:  # pymupdf raises several unrelated types
+                    log.warning("Could not read the style reference %s", path, exc_info=True)
+                    continue
+                if text:
+                    parts.append(f"# {path.name}\n{text}")
+        return "\n\n".join(parts)
 
 
 def _prefix_of(item: Any) -> str:

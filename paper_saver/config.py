@@ -42,6 +42,23 @@ def default_projects_dir() -> Path:
     return base / APP_DISPLAY_NAME / "Papers"
 
 
+def lecture_saver_places() -> list[Path]:
+    """Where Lecture Saver keeps its lectures: its projects folder and the
+    ones it opened last. Only read, never written (§4c.2)."""
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    places = [Path.home() / "Documents" / "Lecture Saver" / "Projects"]
+    try:
+        data = read_json(Path(base) / "LectureSaver" / "settings.json")
+    except (OSError, ValueError):
+        return places
+    if isinstance(data, dict):
+        places += [Path(p) for p in data.get("recent_projects") or [] if isinstance(p, str)]
+    return places
+
+
 def log_file() -> Path:
     return app_data_dir() / "paper_saver.log"
 
@@ -80,6 +97,16 @@ class Settings:
     def projects_dir(self) -> Path:
         stored = self._data.get("projects_dir")
         return Path(stored) if stored else default_projects_dir()
+
+    @property
+    def quiz_styles_dir(self) -> Path:
+        """The library of the professors' earlier quizzes, beside the papers."""
+        stored = self._data.get("quiz_styles_dir")
+        return Path(stored) if stored else self.projects_dir.parent / "Quiz Styles"
+
+    def lecture_saver_places(self) -> list[Path]:
+        stored = self._data.get("lecture_saver_dir")
+        return [Path(stored)] if stored else lecture_saver_places()
 
     def recent_projects(self) -> list[Path]:
         entries = [Path(p) for p in self._data.get("recent_projects", [])]

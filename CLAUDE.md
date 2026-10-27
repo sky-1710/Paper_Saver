@@ -157,9 +157,19 @@ condition judged, a small calculation or scenario).
 §4c.2 Materials are kept apart and named as what they are: the slides (the
 open PDF, never uploaded separately), the lecture's STT (optional; PDF, txt,
 md, srt, vtt), and the professor's earlier quizzes, used for *style only*.
-Registered files are copied into `quiz/materials/` with their text beside them.
-The STT may be several files - a lecture recorded in parts - kept in lecture
-order and joined into one lecture, each file's "Slide N" numbers moved past
+Nothing is uploaded twice. The STT is linked from a Lecture Saver project and
+read from it every time, so a line corrected there is corrected here; the
+recordings named like the PDF ("OS08-PageReplacement.pdf" and
+"OS08-PageReplacement-1", "-2") are offered as soon as the lecture opens, one
+press to link, and the text read last is kept in `quiz/materials/` in case
+the project moves. Lecture Saver's files are only read. An STT file picked
+from disk is copied into `quiz/materials/` with its text beside it. The
+earlier quizzes live once in a library folder (`Quiz Styles` beside the
+papers) that the reader may arrange in the file browser; a lecture ticks the
+files it takes, or a course folder, which takes every file in it, those put
+there later too. They are read when a quiz or a review is asked for, never
+copied into the project. The STT may be several files - a lecture recorded
+in parts - kept in lecture order and joined into one lecture, each file's "Slide N" numbers moved past
 the files before it; the one-page review and Cornell notes (§4d) use the same
 list.
 
@@ -272,6 +282,7 @@ the whole paper.
 ## 6. PROJECT FOLDER
 
     <Projects>/library.json     the start screen's folders, in order
+    <Projects>/../Quiz Styles/  the professors' earlier quizzes, linked by lectures
     <Projects>/<paper title>/
         paper.json          source, page count, page sizes, folder
         highlights.json     highlighted sentences and strokes (the bookmarks)
@@ -283,8 +294,10 @@ the whole paper.
         chat.json           the GPT conversation
         captures/           captures attached to questions
         chat_files/         files attached to the conversation, with their text
-        quiz.json           slide quizzes, answers, the list of quiz materials
-        quiz/materials/     the STT and style references, copied in, with their text
+        quiz.json           slide quizzes, answers, the list of quiz materials:
+                            STT files, linked Lecture Saver projects, linked styles
+        quiz/materials/     STT files copied in, with their text; the text a linked
+                            Lecture Saver project held when last read
         review.json         the one-page review and Cornell notes, as Markdown,
                             and the text of each sentence they cite
         note.md, assets/    the Markdown note, until the reader moves it
