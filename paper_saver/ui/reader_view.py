@@ -63,6 +63,7 @@ from ..core.chat import ChatLog, render_citations, resolve_citations
 from ..core.chat_context import ContextBuilder, PaperSource, SessionState
 from ..core.geometry import Rect
 from ..core.lecture import (
+    EvidenceIndex,
     SlideDeck,
     align_transcript,
     combine_transcripts,
@@ -81,7 +82,7 @@ from ..core.lecture_saver import (
 from ..core.notebook import IMAGE_SUFFIXES
 from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
 from ..core.project import HIGHLIGHT_COLORS, Project, WordEntry
-from ..core.quiz import QuizStore, StyleLibrary, id_prefix
+from ..core.quiz import QuizQuestion, QuizStore, StyleLibrary, id_prefix
 from ..core.review import KINDS as REVIEW_KINDS
 from ..core.review import ReviewStore, plain_citations, refs_in
 from ..pdf.document import PaperDocument
@@ -284,10 +285,14 @@ class ReaderView(QWidget):
         self.note_panel = NotePanel(project, settings)
         self.quiz_store = QuizStore(project.root)
         self.style_library = StyleLibrary(settings.quiz_styles_dir, MATERIAL_SUFFIXES)
+        self._evidence_index: EvidenceIndex | None = None
+        #: The quiz tab stays on its question while the reader looks at
+        #: another page for its evidence, until a page is clicked.
+        self._quiz_away = False
         self.quiz_panel = QuizPanel(
             self.quiz_store, session.page_count,
             Path(str(project.meta.get("source") or project.pdf_path)).name,
-            project.exports_dir, project.title, library=self.style_library,
+            project.exports_dir, project.title, library=self.style_library, evidence=self._quiz_evidence_of,
         )
         self._lecture_task: BackgroundTask | None = None
         self._deck: SlideDeck | None = None
@@ -435,6 +440,7 @@ class ReaderView(QWidget):
             )
             canvas.captureCancelled.connect(self.cancel_capture)
             canvas.pressed.connect(lambda: self.show_evidence([], scroll=False))
+            canvas.pressed.connect(self._follow_quiz)
         self.chat_panel.sendRequested.connect(self.ask_gpt)
         self.chat_panel.stopRequested.connect(self.stop_gpt)
         self.chat_panel.imagePasted.connect(
@@ -449,6 +455,7 @@ class ReaderView(QWidget):
         self.quiz_panel.generateRequested.connect(self.generate_quiz)
         self.quiz_panel.stopRequested.connect(self.stop_quiz)
         self.quiz_panel.slideRequested.connect(self._show_slide)
+        self.quiz_panel.evidenceRequested.connect(self._quiz_evidence)
         for panel in (self.quiz_panel, *self.review_panels.values()):
             panel.transcriptsChosen.connect(self._register_transcripts)
             panel.transcriptRemoved.connect(self._remove_transcript)
@@ -546,7 +553,10 @@ class ReaderView(QWidget):
         if page != self._page:
             self._page = page
             self.pageChanged.emit(page)
-            self.quiz_panel.set_slide(page + 1)
+            if self._quiz_away:
+                self.quiz_panel.set_away(page + 1)
+            else:
+                self.quiz_panel.set_slide(page + 1)
 
     @property
     def current_page(self) -> int:
@@ -1428,8 +1438,48 @@ class ReaderView(QWidget):
     def _show_slide(self, slide: int) -> None:
         """The quiz tab's slide buttons: scroll there, and make sure the tab
         follows even where the last page cannot be scrolled to the top."""
+        self._quiz_away = False
+        self.quiz_panel.set_away(None)
         self.goto_page(slide - 1)
         self.quiz_panel.set_slide(slide)
+
+    def _quiz_evidence_of(self, question: QuizQuestion) -> dict[int, list[str]]:
+        """The sentences a quiz question rests on, by page (§4c.5)."""
+        if self._evidence_index is None:
+            self._evidence_index = EvidenceIndex(
+                (page.number, s.id, s.text) for page, _, s in self.session.layout.sentences()
+            )
+        return self._evidence_index.evidence(f"{question.question}\n{question.explanation}", question.slide - 1)
+
+    def _quiz_evidence(self, ids: list[str], page: int) -> None:
+        """Light what a quiz question rests on; with ``page`` (from 1), go
+        there, the quiz tab staying on the question if that is another slide."""
+        if page and self._page_side() is None:
+            # Both panes show documents: the left turns to the original.
+            self.set_pane_mode("left", "original")
+            QTimer.singleShot(0, self, lambda: self._quiz_evidence(ids, page))
+            return
+        self.show_evidence(ids, scroll=False)
+        if not page:
+            return
+        slide = self.quiz_panel.slide
+        if page != slide:
+            self._quiz_away = True
+            self.quiz_panel.set_away(page)
+        first = next((i for i in ids if self._page_of(i) == page - 1), None)
+        if first is None or not self._scroll_to_sentence(first):
+            self.goto_page(page - 1)
+        if first is not None:
+            self._set_pair(first)
+        if page == slide:
+            self._follow_quiz(slide)
+
+    def _follow_quiz(self, slide: int | None = None) -> None:
+        """The quiz tab follows the pages again, from ``slide`` or the page in view."""
+        if self._quiz_away:
+            self._quiz_away = False
+            self.quiz_panel.set_away(None)
+            self.quiz_panel.set_slide(slide or self._page + 1)
 
     def _load_deck(self) -> None:
         """Read every slide's text once, for the titles the quiz tab shows."""

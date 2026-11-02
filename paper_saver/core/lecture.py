@@ -25,6 +25,10 @@ needs before anything is sent to Codex:
     The professor's previous quizzes, reduced to their numbered statements,
     answers and explanations. Only the *style* is used; the prompt says so.
 
+``EvidenceIndex``
+    The way back: an answered question matched to the sentences it rests
+    on, on its own slide and on the others it applies, so they can be lit.
+
 Pure text processing: no Qt, no PyMuPDF, testable anywhere.
 """
 
@@ -33,10 +37,11 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 __all__ = [
+    "EvidenceIndex",
     "SlideDeck",
     "StyleExample",
     "TranscriptSection",
@@ -548,6 +553,83 @@ def transcript_excerpt(
         labels.append(section.label + (f" ({section.span})" if section.span else ""))
         used += len(head) + len(text) + 2
     return "\n\n".join(parts), ", ".join(labels)
+
+
+# -- what a question rests on -------------------------------------------------------
+
+#: Words that join a statement without naming anything in it: "even though"
+#: on two slides is no link between them.
+_FILLER = frozenset(
+    """even though although too may might can cannot still need needs without within enough must able unless
+    whether either neither since therefore thus however every using used use via""".split()
+)
+
+
+def _terms(text: str) -> list[str]:
+    return [t for t in _tokens(text) if t not in _FILLER]
+
+
+class EvidenceIndex:
+    """The lecture's sentences, searched for what a quiz question rests on (§4c.5).
+
+    A question is written from one slide, but a hard one applies what other
+    slides say: "stride scheduling picks the lowest pass value", asked on the
+    slide comparing it with lottery, rests on the slide before. The question
+    and its explanation are matched against every sentence by the words and
+    two-word phrases they share, each word weighed by how few pages carry it,
+    as :func:`align_transcript` weighs them - a word on every slide links
+    nothing. The question's own slide is always where it starts; another page
+    is taken only when it shares a phrase and matches nearly as well as that
+    slide does - and at least as well as two words found on no other page
+    would, so a question its slide hardly matches does not light stray
+    pages. Nothing is sent anywhere.
+    """
+
+    def __init__(self, sentences: Iterable[tuple[int, str, str]]) -> None:
+        """``sentences``: (page index, sentence id, text), in reading order."""
+        self._rows: list[tuple[int, str, set[str], set[tuple[str, str]]]] = []
+        on_page: dict[int, set[str]] = {}
+        for page, sentence_id, text in sentences:
+            terms = _terms(text)
+            self._rows.append((page, sentence_id, set(terms), set(zip(terms, terms[1:]))))
+            on_page.setdefault(page, set()).update(terms)
+        df: Counter[str] = Counter()
+        for terms in on_page.values():
+            df.update(terms)
+        count = max(1, len(on_page))
+        self._idf = {t: math.log((1 + count) / (1 + n)) for t, n in df.items()}
+        self._floor = 2 * math.log((1 + count) / 2)
+
+    def evidence(self, text: str, home: int, *, pages: int = 3, per_page: int = 3) -> dict[int, list[str]]:
+        """The sentences ``text`` rests on, ``{page index: [sentence id]}`` in
+        page order: those of page ``home`` and of at most ``pages`` others,
+        at most ``per_page`` on each, best first."""
+        terms = _terms(text)
+        words, phrases = set(terms), set(zip(terms, terms[1:]))
+        idf = self._idf
+        # (score, shares a phrase, page, id)
+        scored: list[tuple[float, bool, int, str]] = []
+        for page, sentence_id, own_words, own_phrases in self._rows:
+            joined = phrases & own_phrases
+            score = sum(idf[t] for t in words & own_words) + sum((idf[a] + idf[b]) / 2 for a, b in joined)
+            if score > 0:
+                scored.append((score, bool(joined), page, sentence_id))
+        home_best = max((s for s, _, page, _ in scored if page == home), default=0.0)
+        linked: dict[int, float] = {}
+        for score, joined, page, _ in scored:
+            if joined and page != home:
+                linked[page] = max(linked.get(page, 0.0), score)
+        bar = max(0.6 * home_best, self._floor)
+        others = sorted((p for p, best in linked.items() if best >= bar), key=lambda p: -linked[p])[:pages]
+        out: dict[int, list[str]] = {}
+        for page, best in ((home, home_best), *((p, linked[p]) for p in others)):
+            rows = sorted(
+                (row for row in scored if row[2] == page and (page == home or row[1]) and row[0] >= 0.6 * best),
+                key=lambda row: -row[0],
+            )
+            if rows:
+                out[page] = [sentence_id for *_, sentence_id in rows[:per_page]]
+        return dict(sorted(out.items()))
 
 
 # -- the professor's quizzes -------------------------------------------------------

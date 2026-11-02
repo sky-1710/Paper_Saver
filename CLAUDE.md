@@ -184,6 +184,13 @@ give the answer away) and retried once with the reason before failing. A
 slide's quiz and the reader's answers are kept in `quiz.json` until the
 reader presses Regenerate.
 
+§4c.5 A hard question often applies another slide, so an answered question
+lights what it rests on: the sentences of its own slide and of up to three
+other pages that share its words and phrases with its explanation, each word
+weighed by how few pages carry it. This matching runs locally; nothing is
+sent. The card lists those pages (근거 위치). Going to one keeps the 퀴즈 tab
+on the question until a page is clicked.
+
 ---
 
 ## 4d. ONE-PAGE REVIEW AND CORNELL NOTES

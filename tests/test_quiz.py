@@ -501,6 +501,30 @@ def test_transcript_without_markers_is_chunked_and_still_matched() -> None:
     assert 0 in mapping[2]
 
 
+def test_a_question_rests_on_its_slide_and_the_pages_it_applies() -> None:
+    from paper_saver.core.lecture import EvidenceIndex
+
+    index = EvidenceIndex([
+        (0, "a", "Lottery Scheduling"),
+        (0, "b", "Each job holds tickets; a random draw picks the winner."),
+        (1, "c", "Stride Scheduling"),
+        (1, "d", "Pick the process to run that has the lowest pass value so far."),
+        (1, "e", "Each time a process runs, its pass value grows by its stride."),
+        (2, "f", "Comparison between lottery and stride schedulers"),
+        (2, "g", "Lottery scheduling has no global state."),
+        (3, "h", "Homework: read chapter nine before the next lecture."),
+    ])
+    # Asked on the comparison slide, it applies the slide before.
+    found = index.evidence(
+        "Stride scheduling selects a process with the lowest pass value.\n"
+        "슬라이드에 따르면 stride scheduling은 pass value가 가장 작은 process를 고릅니다.",
+        home=2,
+    )
+    assert found == {1: ["d", "e"], 2: ["f"]}
+    # A word or two in common, with no phrase, lights no other page.
+    assert index.evidence("Even the lowest value of a lecture", home=0) == {}
+
+
 def test_quiz_examples_are_taken_in_sequence() -> None:
     from paper_saver.core.lecture import extract_quiz_examples, format_quiz_examples
 
@@ -559,6 +583,118 @@ def test_panel_shows_answers_hints_and_result(qapp, tmp_path: Path) -> None:
     panel.slideRequested.connect(requested.append)
     next(b for b in panel._body.findChildren(QPushButton) if b.text() == "다음 슬라이드 ▶").click()
     assert requested == [3]
+
+
+def test_an_answer_lights_its_evidence_and_lists_the_pages(qapp, tmp_path: Path) -> None:
+    from PySide6.QtWidgets import QLabel, QPushButton
+
+    from paper_saver.core.quiz import QuizStore, slide_quiz_from_dict
+    from paper_saver.ui.quiz_panel import QuizPanel
+
+    store = QuizStore(tmp_path)
+    store.put(slide_quiz_from_dict(_quiz_dict(), slide=2))
+
+    def evidence(question) -> dict[int, list[str]]:
+        return {1: ["s2"], 3: ["s4a", "s4b"]} if question.difficulty == "hard" else {}
+
+    panel = QuizPanel(store, 5, "OS06-Memory.pdf", tmp_path, evidence=evidence)
+    panel.set_slide(2)
+    lit: list[tuple[list, int]] = []
+    panel.evidenceRequested.connect(lambda ids, page: lit.append((ids, page)))
+
+    def links() -> list[QLabel]:
+        return [label for label in panel._body.findChildren(QLabel) if label.objectName() == "quizEvidence"]
+
+    assert not links()  # nothing before the answer
+    hard = [b for b in panel._body.findChildren(QPushButton) if b.text() == "O" and b.isEnabled()][2]
+    hard.click()
+    assert lit == [(["s2", "s4a", "s4b"], 0)]  # lit at once, the reader left where they are
+    [label] = links()
+    assert label.text().index("이 슬라이드") < label.text().index(">p.4<")
+    label.linkActivated.emit("4")
+    assert lit[-1] == (["s2", "s4a", "s4b"], 4)
+    easy = [b for b in panel._body.findChildren(QPushButton) if b.text() == "O" and b.isEnabled()][0]
+    easy.click()
+    assert len(lit) == 2 and len(links()) == 1  # nothing found, nothing lit or listed
+
+    panel.set_away(4)
+    assert not panel.away_bar.isHidden() and "p.4" in panel.away_label.text()
+    requested: list[int] = []
+    panel.slideRequested.connect(requested.append)
+    panel.back_button.click()
+    assert requested == [2]
+    panel.set_away(None)
+    assert panel.away_bar.isHidden()
+
+
+def test_reader_keeps_the_question_while_its_evidence_is_shown(qapp, tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    import pymupdf
+
+    from paper_saver.config import Settings
+    from paper_saver.core.quiz import slide_quiz_from_dict
+    from paper_saver.ui.main_window import MainWindow, _prepare
+
+    pdf = tmp_path / "OS07-Scheduling.pdf"
+    doc = pymupdf.open()
+    for body in (
+        "Lottery scheduling gives each job tickets, and a random draw picks the winner of the processor. "
+        "A job holding more tickets wins more often over a long run.",
+        "Stride scheduling is deterministic. Pick the process to run that has the lowest pass value so far. "
+        "Each time a process runs, its pass value grows by its stride.",
+        "Comparison between lottery and stride schedulers. Lottery scheduling has no global state, "
+        "so a new job is simple to add.",
+    ):
+        page = doc.new_page(width=612, height=792)
+        page.insert_textbox(pymupdf.Rect(72, 90, 540, 300), body, fontsize=11)
+    doc.save(pdf)
+
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("auto_translate", False)
+    window = MainWindow(settings)
+    window.resize(1400, 900)
+    window.show()
+    project, layout = _prepare(pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    window._opened((project, layout))
+    for _ in range(5):  # the first zoom, and the scroll it puts back
+        qapp.processEvents()
+    reader, panel = window.reader, window.reader.quiz_panel
+    page_of = {s.id: page.number for page, _, s in layout.sentences()}
+
+    quiz = _quiz_dict(slide=3)
+    [item] = [q for q in quiz["questions"] if q["difficulty"] == "easy"]
+    item["question"] = "Stride scheduling selects the process with the lowest pass value."
+    item["explanation"] = "pass value가 가장 작은 process를 고릅니다."
+    reader.quiz_store.put(slide_quiz_from_dict(quiz, slide=3))
+    reader.side.setCurrentWidget(panel)
+    reader._show_slide(3)
+    qapp.processEvents()
+    assert panel.slide == 3
+
+    [easy] = [q for q in reader.quiz_store.get(3).questions if q.difficulty == "easy"]
+    panel.choose(easy, True)
+    assert {page_of[i] for i in reader.left._evidence} == {1, 2}  # its slide, and the one it applies
+    assert reader.right._evidence == reader.left._evidence
+    assert panel.slide == 3
+
+    panel.show_evidence(easy, 2)  # "p.2" in its card
+    qapp.processEvents()
+    assert reader.current_page == 1 and panel.slide == 3  # the question stays
+    assert not panel.away_bar.isHidden() and "p.2" in panel.away_label.text()
+
+    reader.left.pressed.emit()  # a click on the page: lights out, the tab follows again
+    assert reader.left._evidence == [] and panel.away_bar.isHidden()
+    assert panel.slide == 2
+
+    reader._show_slide(3)
+    panel.show_evidence(easy, 2)
+    qapp.processEvents()
+    assert reader.current_page == 1 and panel.slide == 3
+    panel.back_button.click()  # or back to the question's slide
+    qapp.processEvents()
+    assert panel.slide == 3 and panel.away_bar.isHidden()
+    window.close()
 
 
 def _wait(qapp, condition, seconds: float = 10.0) -> None:

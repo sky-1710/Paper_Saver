@@ -46,6 +46,8 @@ QLabel#quizRight { font-weight: 700; color: #137333; }
 QLabel#quizWrong { font-weight: 700; color: #c5221f; }
 QLabel#quizExplainTitle { font-weight: 600; color: #3c4043; }
 QLabel#quizExplain { color: #3c4043; }
+QLabel#quizEvidence { color: #5f6368; padding-top: 2px; }
+QFrame#quizAway { background: #e6f4ea; border: 1px solid #b7dfc3; border-radius: 6px; }
 QPushButton#quizChoice { font-size: 13pt; font-weight: 700; min-width: 64px; padding: 5px 0; }
 QPushButton#quizPrimary { background: #1a73e8; color: white; border-color: #1a73e8; padding: 7px 18px; font-weight: 600; }
 QPushButton#quizPrimary:hover { background: #1765cc; }

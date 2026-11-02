@@ -11,6 +11,10 @@ linked from Lecture Saver (the recordings named like this PDF are offered at
 once) or picked as files; the style references are ticked in the library,
 which holds them once for every lecture.
 
+An answered question lights the sentences it rests on (§4c.5) - on its slide
+and on any other page it applies - and its card lists those pages. Going to
+one keeps the tab on the question until a page is clicked.
+
 This widget draws and reports; it runs nothing. Generating a quiz and reading
 a material file happen in the reader view's workers (§7.4). Each question is
 drawn by a card function chosen by its type, so a new question type is a new
@@ -130,6 +134,8 @@ class QuizPanel(QWidget):
     #: only), "right" or "below" (each slide with its questions there); the
     #: reader view writes it.
     pdfExportRequested = Signal(str, str)
+    #: Light these sentences; with a page (from 1), go there - 0 stays put.
+    evidenceRequested = Signal(list, int)
 
     def __init__(
         self,
@@ -141,10 +147,13 @@ class QuizPanel(QWidget):
         parent: QWidget | None = None,
         *,
         library: StyleLibrary | None = None,
+        evidence: Callable[[QuizQuestion], dict[int, list[str]]] | None = None,
     ) -> None:
         super().__init__(parent)
         self.store = store
         self.library = library
+        #: The sentences a question rests on, {page index: [sentence id]}.
+        self._evidence = evidence
         #: Lecture Saver's recordings, and those named like this PDF (their keys).
         self._lectures: list[LectureProject] = []
         self._suggested: list[str] = []
@@ -187,6 +196,18 @@ class QuizPanel(QWidget):
         layout.addLayout(head)
         self.title_label = _label("", "quizTitle")
         layout.addWidget(self.title_label)
+        # Shown while the reader is on another page for a question's evidence.
+        self.away_bar = QFrame()
+        self.away_bar.setObjectName("quizAway")
+        away = QHBoxLayout(self.away_bar)
+        away.setContentsMargins(8, 4, 4, 4)
+        self.away_label = _label("")
+        self.back_button = QPushButton()
+        self.back_button.clicked.connect(lambda: self.slideRequested.emit(self.slide))
+        away.addWidget(self.away_label, 1)
+        away.addWidget(self.back_button)
+        self.away_bar.hide()
+        layout.addWidget(self.away_bar)
 
         self._body = QWidget()
         self._body_layout = QVBoxLayout(self._body)
@@ -490,6 +511,16 @@ class QuizPanel(QWidget):
             self.slide = slide
             self.refresh()
 
+    def set_away(self, page: int | None) -> None:
+        """The reader is on ``page`` (from 1) for a question's evidence while
+        this tab stays on its slide; None when it follows the pages again."""
+        self.away_bar.setVisible(page is not None)
+        if page is not None:
+            self.away_label.setText(
+                f"p.{page} 보는 중 — 퀴즈는 Slide {self.slide}에 머뭅니다. 페이지를 누르면 다시 따라갑니다."
+            )
+            self.back_button.setText(f"◀ Slide {self.slide}")
+
     def set_titles(self, titles: dict[int, str]) -> None:
         """Slide titles by number (from 1), once the slides have been read."""
         self._titles = dict(titles)
@@ -655,6 +686,38 @@ class QuizPanel(QWidget):
     def choose(self, question: QuizQuestion, answer: Any) -> None:
         if self.store.choose(self.slide, question.id, answer):
             self.refresh()
+            # The explanation is up: light what it rests on, here and elsewhere.
+            self.show_evidence(question)
+
+    def evidence_of(self, question: QuizQuestion) -> dict[int, list[str]]:
+        """The sentences ``question`` rests on: ``{page index: [sentence id]}``."""
+        return self._evidence(question) if self._evidence is not None else {}
+
+    def show_evidence(self, question: QuizQuestion, page: int = 0) -> None:
+        """Light the sentences ``question`` rests on, on every page; with
+        ``page`` (from 1), go there."""
+        ids = [i for group in self.evidence_of(question).values() for i in group]
+        if ids:
+            self.evidenceRequested.emit(ids, page)
+
+    def _evidence_links(self, question: QuizQuestion) -> QLabel | None:
+        """"근거 위치  이 슬라이드 · p.4 · p.7", each page a link."""
+        pages = sorted((page + 1 for page in self.evidence_of(question)), key=lambda page: page != question.slide)
+        if not pages:
+            return None
+        links = " · ".join(
+            f'<a href="{page}" style="color:#137333; text-decoration:none;">'
+            + ("이 슬라이드" if page == question.slide else f"p.{page}")
+            + "</a>"
+            for page in pages
+        )
+        label = QLabel(f"근거 위치 &nbsp;{links}")
+        label.setObjectName("quizEvidence")
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setWordWrap(True)
+        label.setToolTip("누르면 그 페이지로 가서 근거 문장을 표시합니다. 퀴즈는 이 문제에 머뭅니다.")
+        label.linkActivated.connect(lambda href, q=question: self.show_evidence(q, int(href)))
+        return label
 
     def reveal_hint(self, question: QuizQuestion) -> None:
         self.store.reveal_hint(self.slide, question.id)
@@ -770,6 +833,9 @@ def _true_false_card(panel: QuizPanel, question: QuizQuestion, index: int, attem
         )
         layout.addWidget(_label("Explanation", "quizExplainTitle"))
         layout.addWidget(_label(question.explanation, "quizExplain"))
+        links = panel._evidence_links(question)
+        if links is not None:
+            layout.addWidget(links)
     return card
 
 
