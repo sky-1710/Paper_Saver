@@ -15,7 +15,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-__all__ = ["Rect", "merge_into_lines", "union_all"]
+__all__ = ["Rect", "merge_into_lines", "mostly_landscape", "union_all"]
+
+
+def mostly_landscape(sizes: Iterable[tuple[float, float]]) -> bool:
+    """Whether most (width, height) pages are wider than tall: a slide deck."""
+    pages = list(sizes)
+    return bool(pages) and sum(1 for width, height in pages if width > height * 1.1) * 2 > len(pages)
 
 
 @dataclass(frozen=True, slots=True)

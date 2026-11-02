@@ -48,7 +48,9 @@ its tab.
 papers come first within a folder). A folder is a label written into the
 paper's `paper.json`, never a directory the project is moved into, so
 nothing that refers to a project folder breaks; the folder list and its order
-live in `<Projects>/library.json`, so an empty folder stays.
+live in `<Projects>/library.json`, so an empty folder stays. A paper is listed
+under its title; a slide deck under its file name, since every deck of one
+course can carry the same template title.
 
 ---
 

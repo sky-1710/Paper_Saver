@@ -36,6 +36,7 @@ from typing import Any
 
 from .atomic_io import read_json, write_json_atomic
 from .chat import resolve_citations
+from .geometry import mostly_landscape
 from .models import BlockKind, PaperLayout
 
 log = logging.getLogger(__name__)
@@ -101,8 +102,7 @@ SPOKEN_LABEL = "(강의 STT — 이 쪽을 설명한 부분)"
 
 def looks_like_slides(layout: PaperLayout) -> bool:
     """Whether the PDF is a slide deck: most of its pages are landscape."""
-    pages = layout.pages
-    return bool(pages) and sum(1 for page in pages if page.width > page.height * 1.1) * 2 > len(pages)
+    return mostly_landscape((page.width, page.height) for page in layout.pages)
 
 
 def _appendix_heading(text: str) -> bool:

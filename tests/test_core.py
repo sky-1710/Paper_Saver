@@ -148,6 +148,40 @@ def test_same_pdf_reuses_project(tmp_path: Path, two_column_pdf: Path) -> None:
     assert second.root == first.root and second.translations.get("x") == "번역"
 
 
+def _titled_pdf(path: Path, size: tuple[int, int], heading: str, metadata: str = "") -> str:
+    """The title a PDF of this shape, heading and metadata is given."""
+    import pymupdf
+
+    from paper_saver.pdf.document import PaperDocument
+
+    document = pymupdf.open()
+    document.new_page(width=size[0], height=size[1]).insert_text((60, 120), heading, fontsize=28)
+    document.set_metadata({"title": metadata})
+    document.save(path)
+    document.close()
+    with PaperDocument(path) as opened:
+        return opened.title()
+
+
+def test_decks_of_one_template_are_told_apart_by_their_files(tmp_path: Path) -> None:
+    """Every deck of a course carries the template's title; only its file differs."""
+    template = "Lectures for 2nd Edition"
+    names = ["OS06-Memory.pdf", "OS07-Paging.pdf", "OS02-LimitedDirectExecution (1).pdf"]
+    titles = [_titled_pdf(tmp_path / n, (720, 540), "Chap 18, 19, 20", template) for n in names]
+    assert titles == ["OS06-Memory", "OS07-Paging", "OS02-LimitedDirectExecution"]
+
+
+def test_deck_whose_file_says_nothing_is_named_from_its_page(tmp_path: Path) -> None:
+    assert _titled_pdf(tmp_path / "12345.pdf", (720, 540), "Exploratory Data Analysis") == "Exploratory Data Analysis"
+
+
+def test_paper_keeps_its_own_title_not_its_file_name(tmp_path: Path) -> None:
+    letter = (612, 792)
+    title = "TrigReason: Trigger-Based Collaboration"
+    assert _titled_pdf(tmp_path / "2604.14847v1.pdf", letter, "Heading text", title) == title
+    assert _titled_pdf(tmp_path / "2604.14848v1.pdf", letter, "Confidence Leaps in LLMs") == "Confidence Leaps in LLMs"
+
+
 def test_translation_follows_text_not_position(tmp_path: Path, two_column_pdf: Path) -> None:
     """Re-extraction can renumber sentences; a translation must stay with its text."""
     from paper_saver.core.models import Block, PageLayout, PaperLayout, Sentence, Word

@@ -19,7 +19,7 @@ from typing import Any
 
 import pymupdf
 
-from ..core.geometry import Rect
+from ..core.geometry import Rect, mostly_landscape
 
 # Table detection prints an advert for an optional package once per process.
 if hasattr(pymupdf, "no_recommend_layout"):
@@ -121,19 +121,36 @@ class PaperDocument:
     # -- what to call this paper --------------------------------------------
 
     def title(self) -> str:
-        return guess_title(self._doc)
+        return guess_title(self._doc, self.path.name)
 
 
 _BAD_TITLES = {"", "untitled", "microsoft word", "pdf", "paper", "main", "manuscript"}
 
 
-def guess_title(document: Any) -> str:
-    """A name for the project folder: the PDF's own title, or its first line.
+def _file_title(file_name: str) -> str:
+    """"OS02-Direct (1).pdf" -> "OS02-Direct"; "" for a name that says nothing."""
+    stem = re.sub(r"\.pdf$", "", file_name.strip(), flags=re.IGNORECASE)
+    stem = re.sub(r"\s*\(\d+\)$", "", stem)  # a second download
+    return stem if stem.lower() not in _BAD_TITLES and re.search(r"[^\W\d_]", stem) else ""
+
+
+def guess_title(document: Any, file_name: str = "") -> str:
+    """A name for the paper: the PDF's own title, or its first line.
 
     PDF metadata titles are unreliable - LaTeX often leaves the name of the tex
     file, Word leaves "Microsoft Word - final(3).doc" - so a metadata title is
     only trusted when it looks like a sentence of English or Korean.
+
+    A slide deck goes by its file name. Its metadata is the template's - every
+    deck of a course says "Lectures for 2nd Edition" - and the biggest text on
+    its first page is as likely "Chap 18, 19, 20" as the topic, while the file
+    is "OS07-Paging".
     """
+    if mostly_landscape((page.rect.width, page.rect.height) for page in document):
+        named = _file_title(file_name)
+        if named:
+            return named[:120]
+
     metadata = (document.metadata or {}).get("title") or ""
     candidate = re.sub(r"\s+", " ", metadata).strip()
     if candidate.lower().split(".")[0] not in _BAD_TITLES and len(candidate) >= 12:
