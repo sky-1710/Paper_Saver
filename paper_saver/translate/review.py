@@ -58,7 +58,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "SCHEMAS", "CodexReviewGenerator", "ReviewRequest", "default_lecture", "page_notes", "parse_review_answer",
-    "review_prompt", "review_request",
+    "review_context", "review_prompt", "review_request",
 ]
 
 
@@ -287,6 +287,18 @@ def page_notes(seconds: Mapping[int, int], visits: Mapping[int, int]) -> dict[in
 
 
 def review_prompt(request: ReviewRequest, *, retry_reason: str = "") -> str:
+    parts = review_context(request)
+    parts.append(_ASK[(request.kind, request.lecture)])
+    if retry_reason:
+        parts.append(f"직전 답은 형식 검사를 통과하지 못했습니다: {retry_reason}\n규칙을 모두 지켜 처음부터 다시 쓰세요.\n")
+    parts.append(f"{KINDS[request.kind]} JSON:")
+    return "\n".join(parts)
+
+
+def review_context(request: ReviewRequest) -> list[str]:
+    """Everything before what to write: the rules, the paper, the lecture's
+    signals and the professor's quizzes. Shared by every document asked of
+    one paper (and by 백지 복습), so OpenAI's prompt cache can serve it."""
     parts = [_RULES]
     if request.transcripts:
         names = ", ".join(f"영상 {n} = {name}" for n, name in enumerate(request.transcripts, start=1))
@@ -308,11 +320,7 @@ def review_prompt(request: ReviewRequest, *, retry_reason: str = "") -> str:
             "묻는지 보고, 이 강의에서 같은 종류의 세부를 놓치지 마세요. 이 퀴즈의 내용을 문서에 옮기지는 마세요."
         )
         parts.append(f"<<<\n{styles}\n>>>\n")
-    parts.append(_ASK[(request.kind, request.lecture)])
-    if retry_reason:
-        parts.append(f"직전 답은 형식 검사를 통과하지 못했습니다: {retry_reason}\n규칙을 모두 지켜 처음부터 다시 쓰세요.\n")
-    parts.append(f"{KINDS[request.kind]} JSON:")
-    return "\n".join(parts)
+    return parts
 
 
 def review_request(

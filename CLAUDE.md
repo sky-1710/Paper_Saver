@@ -246,6 +246,39 @@ with its citations as page numbers.
 
 ---
 
+## 4e. 백지 복습 (BLANK-PAGE RECALL)
+
+§4e.1 The blank-page method: given only keywords, the reader writes down
+everything they remember of the PDF, then sees what was missing. A pane's
+header shows it (`백지 복습`); there is one panel, in whichever pane chose it.
+
+§4e.2 The standard is the PDF itself, never the one-page review or the
+Cornell notes, which are a summary of it. On the reader's press GPT makes,
+from the whole PDF as a review sees it (§4d.2), a sheet kept in `blank.json`:
+topics in the PDF's order, each with keywords (terms only, short enough not
+to be answers) and an answer key (statements a full answer holds, each
+citing its sentences, ★ where the lecture stressed it). The key is made from
+the PDF's text; the STT only says what was stressed. Figures and tables are
+the PDF too: the regions the layout keeps as pixels, less a template's logo,
+are cut out of the PDF and attached as pictures, one per page that has any
+(§5.3; the reader may turn it off), and an important one is named in the keywords ("표: …") to be drawn
+again from memory.
+
+§4e.3 The reader picks topics and writes on a blank sheet that shows only
+their headings and keywords, in the note's editor, saved as typed (§4.3).
+The other pane is covered until it is marked; "그래도 보기" lifts the cover
+for that attempt.
+
+§4e.4 Marking is against the fixed key, point by point - recalled, partly,
+missed - and lists what the reader wrote that the PDF contradicts, with the
+correction and its sentences; the answer must mark every point or it is sent
+back once. One attempt and the next are counted in the same units, so a
+topic shows its last score beside its new one, and "빠뜨린 것 다시 쓰기"
+starts again on the topics not yet full. A new sheet clears the attempts.
+Clicking a point lights its sentences in the PDF.
+
+---
+
 ## 5. TRANSLATION ENGINE
 
 §5.1 Translation goes through the Codex CLI, signed in with the user's ChatGPT
@@ -268,9 +301,13 @@ slide's text, its matched STT excerpt and the style examples — plus the
 slide's picture only if the reader turned that on. A review or Cornell notes
 (§4d) sends all of the paper's text again - figure, table and code text
 included, and lines the layout could not place read from the page - without
-its reference list and page numbers, and the registered lecture STT with it. The PDF itself and the reader's notes never go to OpenAI;
-a note goes to Notion only on export. Translation, dictionary, quiz and
-review runs leave nothing on disk (`--ephemeral`); the
+its reference list and page numbers, and the registered lecture STT with it.
+백지 복습 (§4e) sends the same text: for the sheet, with the PDF's figures and
+tables cut out as pictures unless the reader turned that off; for a marking,
+with what the reader wrote on the blank sheet. The PDF file and the reader's notes never go to OpenAI;
+a note goes to Notion only on export. Translation, dictionary, quiz,
+review and 백지 runs leave nothing on disk (`--ephemeral`; the figure pictures
+are cut into a scratch folder deleted after the run); the
 session file Codex keeps for a GPT conversation is deleted when the reader
 starts a new conversation or takes off a file it was sent.
 
@@ -309,6 +346,8 @@ the whole paper.
                             Lecture Saver project held when last read
         review.json         the one-page review and Cornell notes, as Markdown,
                             and the text of each sentence they cite
+        blank.json          백지 복습: the keyword sheet and its answer key, every
+                            attempt written and its marking
         note.md, assets/    the Markdown note, until the reader moves it
         exports/
 

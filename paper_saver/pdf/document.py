@@ -118,6 +118,19 @@ class PaperDocument:
         pixmap.save(str(path))
         return path
 
+    def save_region_png(
+        self, number: int, rect: Rect, path: Path, *, longest: int = 1400, most: float = 3.0
+    ) -> Path:
+        """One region of a page as a PNG, re-rendered from the PDF: a figure
+        or table sent with a request. Its longer side is about ``longest``
+        pixels, at no more than ``most`` times the page's size."""
+        zoom = max(1.0, min(most, longest / max(rect.width, rect.height, 1.0)))
+        clip = pymupdf.Rect(rect.x0, rect.y0, rect.x1, rect.y1)
+        pixmap = self._doc[number].get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip, alpha=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pixmap.save(str(path))
+        return path
+
     # -- what to call this paper --------------------------------------------
 
     def title(self) -> str:

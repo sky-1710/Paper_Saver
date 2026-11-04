@@ -10,10 +10,11 @@ the region is rendered sharp and can be asked about in the GPT tab, pasted
 into the note, or copied. When GPT's answer cites sentences of the page, the
 reader scrolls to them and they stay lit until the next click on a page.
 
-Each pane can show any of four things: the original, the translation, a
-one-page review of the paper or Cornell notes on it (§4d) - the original and
-the translation side by side as they start, or the PDF beside the notes, or
-the notes beside the summary. A part of a review, clicked, lights the
+Each pane can show any of five things: the original, the translation, a
+one-page review of the paper or Cornell notes on it (§4d), or 백지 복습 (§4e)
+- the original and the translation side by side as they start, or the PDF
+beside the notes, or the notes beside the summary. While a blank sheet is
+being written the other pane is covered. A part of a review, clicked, lights the
 sentences it rests on in whichever pane shows a page. Scrolling and zoom
 follow the pane that shows one, the left when both do.
 """
@@ -24,6 +25,7 @@ import copy
 import logging
 import re
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -59,6 +61,7 @@ from PySide6.QtWidgets import (
 
 from ..config import Settings
 from ..core.atomic_io import read_json
+from ..core.blank import BlankStore, figure_regions
 from ..core.chat import ChatLog, render_citations, resolve_citations
 from ..core.chat_context import ContextBuilder, PaperSource, SessionState
 from ..core.geometry import Rect
@@ -88,6 +91,7 @@ from ..core.review import ReviewStore, plain_citations, refs_in
 from ..pdf.document import PaperDocument
 from ..pdf.text import MATERIAL_SUFFIXES, MaterialError, read_pages, read_paper, stray_lines
 from ..render.quiz_pdf import PLACEMENTS, quiz_pdf, slides_quiz_pdf
+from ..translate.blank import CodexBlankGenerator
 from ..translate.codex_cli import forget_codex_session
 from ..translate.dictionary import Dictionary, clean_word
 from ..translate.engine import (
@@ -106,6 +110,7 @@ from ..translate.prompts import (
 )
 from ..translate.quiz import CodexQuizGenerator, QuizGenerationInput
 from ..translate.review import CodexReviewGenerator, ReviewRequest, default_lecture, review_request
+from .blank_panel import BlankPanel
 from .bookmarks_panel import BookmarksPanel
 from .chat_panel import ChatPanel
 from .dictionary_panel import DictionaryPanel
@@ -152,12 +157,14 @@ class _Scroll(QScrollArea):
 #: The bar above each pane: one height for both, so their pages line up (§1.3).
 PANE_HEADER_HEIGHT = 28
 #: What either pane can show, and the label of each.
-PANE_MODES = {"original": "원문", "translation": "번역 (직역)", **REVIEW_KINDS}
+PANE_MODES = {"original": "원문", "translation": "번역 (직역)", **REVIEW_KINDS, "blank": "백지 복습"}
 #: The pages, as opposed to a review in their place.
 PAGE_MODES = ("original", "translation")
 _MODE_TIPS = {
     "one_page": "GPT가 쓴 논문 한 장 요약. 항목을 누르면 근거 문장을 원문에서 보여 줍니다.",
     "cornell": "GPT가 쓴 코넬 노트(단서 · 노트 · 요약). 항목을 누르면 근거 문장을 원문에서 보여 줍니다.",
+    "blank": "백지 복습: 키워드만 보고 PDF 내용을 통째로 써 본 뒤, PDF와 맞춰 빠뜨린 것·틀린 것을 채점합니다.\n"
+    "쓰는 동안 옆 창은 가려 둡니다.",
 }
 SIDES = ("left", "right")
 _SIDE_NAMES = {"left": "왼쪽", "right": "오른쪽"}
@@ -311,6 +318,16 @@ class ReaderView(QWidget):
             for side in SIDES
         }
         self._review_tasks: dict[str, BackgroundTask] = {}
+        # 백지 복습: one panel, in whichever pane chose it (§4e).
+        self.blank_store = BlankStore(project.root)
+        self.blank_store.bind(session.layout)
+        self.blank_panel = BlankPanel(
+            self.blank_store, page_of=self._page_of, mode=lambda: self.review_panels["left"].mode,
+            transcripts=lambda: [m.name for m in self.quiz_store.transcripts],
+        )
+        self._blank_task: BackgroundTask | None = None
+        #: The reader chose to see the pane covered while writing.
+        self._peeking = False
         self.side = _SideTabs()
         self.side.addTab(self.dictionary_panel, "사전")
         self.side.addTab(self.chat_panel, "GPT")
@@ -326,6 +343,8 @@ class ReaderView(QWidget):
         self.stacks: dict[str, QStackedWidget] = {}
         self._mode_buttons: dict[str, dict[str, QToolButton]] = {}
         self._modes = {"left": "original", "right": "translation"}
+        #: What hides a pane while 백지 is written in the other one.
+        self._covers: dict[str, QWidget] = {}
         boxes = {}
         for side in SIDES:
             buttons: dict[str, QToolButton] = {}
@@ -341,6 +360,8 @@ class ReaderView(QWidget):
             stack = QStackedWidget()
             stack.addWidget(self.scrolls[side])
             stack.addWidget(self.review_panels[side])
+            self._covers[side] = self._cover()
+            stack.addWidget(self._covers[side])
             self.stacks[side] = stack
             boxes[side] = _pane(_header(*buttons.values()), stack)
         left_box, right_box = boxes["left"], boxes["right"]
@@ -477,6 +498,14 @@ class ReaderView(QWidget):
             panel.documentChanged.connect(lambda kind, o=other: o.kind == kind and o.refresh())
             panel.modeChosen.connect(lambda _mode, o=other: o.refresh())
         self.evidenceLit.connect(lambda count: count or [p.clear_active() for p in self.review_panels.values()])
+        self.evidenceLit.connect(lambda count: count or self.blank_panel.clear_active())
+        blank = self.blank_panel
+        blank.sheetRequested.connect(self.generate_blank_sheet)
+        blank.gradeRequested.connect(self.grade_blank)
+        blank.stopRequested.connect(self.stop_blank)
+        blank.evidenceRequested.connect(lambda ids: self._review_evidence(ids, self._blank_side() or "left"))
+        blank.toNoteRequested.connect(self.blank_to_note)
+        blank.writingChanged.connect(self._on_blank_writing)
         self.side.currentChanged.connect(lambda _i: self.side.currentWidget() is self.quiz_panel and self._load_deck())
         # Translations arrive after a sentence is marked; shown, the list is current.
         self.side.currentChanged.connect(
@@ -1775,18 +1804,31 @@ class ReaderView(QWidget):
     def set_pane_mode(self, side: str, mode: str) -> None:
         if side not in SIDES or mode not in PANE_MODES:
             return
+        other = _other(side)
+        if mode == "blank" and self._modes[other] == "blank":
+            # One 백지 panel: it comes here, and the other pane shows the original.
+            self.set_pane_mode(other, "original")
         self._mode_buttons[side][mode].setChecked(True)
         panel, stack = self.review_panels[side], self.stacks[side]
         before = self._page_side()
+        if self._modes[side] == "blank" and mode != "blank":
+            self.blank_panel.flush()
         self._modes[side] = mode
+        if mode == "blank":
+            panel.stop_editing()
+            if stack.indexOf(self.blank_panel) < 0:
+                self.stacks[other].removeWidget(self.blank_panel)
+                stack.addWidget(self.blank_panel)
+            self._show_stacks()
+            return
         if mode not in PAGE_MODES:
             panel.set_kind(mode)
-            stack.setCurrentWidget(panel)
+            self._show_stacks()
             return
         panel.stop_editing()
         self.canvases[side].set_translated(mode == "translation")
         self._apply_highlights()
-        stack.setCurrentWidget(self.scrolls[side])
+        self._show_stacks()
         # Hidden, these pages kept scrolling with the others but were not laid
         # out; line them up again once they are.
         source = before if before != side else None
@@ -1825,45 +1867,13 @@ class ReaderView(QWidget):
             for panel in self.review_panels.values():
                 panel.set_error(kind, "GPT 사용에 동의하고 Codex가 설치되어 있어야 만들 수 있습니다.")
             return
-        layout, title, store = self.session.layout, self.session.project.title, self.review_store
-        pdf, deck = self.session.project.pdf_path, self._deck
-        transcripts = self.quiz_store.transcript_parts()
-        names = tuple(name for name, _ in transcripts)
-        read_styles = self._style_reader()
-        mode = self.review_panels["left"].mode
-        lecture = mode == "lecture"
+        layout, store = self.session.layout, self.review_store
+        prepare, names, lecture = self._paper_request(kind)
+        mode = "lecture" if lecture else "paper"
 
         def work(cancel, _report):  # type: ignore[no-untyped-def]
-            styles = read_styles()
-            try:
-                strays = stray_lines(pdf, layout)
-            except Exception:  # pymupdf raises several unrelated types
-                log.warning("Could not read the lines the layout left out", exc_info=True)
-                strays = {}
-            # The STT is matched to the slides as the quiz matches them, all of it.
-            slides = (deck or SlideDeck(read_pages(pdf))).pages if transcripts else []
-
-            def ask(until_references: bool = False) -> ReviewRequest:
-                return review_request(
-                    kind, title, layout, strays=strays, transcripts=transcripts, slides=slides, styles=styles,
-                    lecture=lecture, until_references=until_references,
-                )
-
-            request = ask()
-            if not request.numbering:
-                raise TranslationError("이 PDF에서 정리할 본문 문장을 찾지 못했습니다. (스캔한 PDF에는 글자가 없습니다)")
             generator = CodexReviewGenerator(engine)
-            note = ""
-            try:
-                markdown = generator.generate(request, cancel=cancel)
-            except EnginePromptRejected:
-                # A grading prompt quoted in an appendix will do it: the paper
-                # up to its references, once more.
-                shorter = ask(until_references=True)
-                if not shorter.numbering or len(shorter.text) >= len(request.text):
-                    raise
-                markdown = generator.generate(shorter, cancel=cancel)
-                note = "OpenAI가 논문 전체를 거절해서(부록에 인용된 프롬프트 때문일 때가 많습니다) 참고문헌 앞까지만 보내 만들었습니다."
+            markdown, note = _whole_paper(prepare(), lambda request: generator.generate(request, cancel=cancel))
             texts = {s.id: s.text for _, _, s in layout.sentences()}
             anchors = {i: texts[i] for i in refs_in(markdown) if i in texts}
             return markdown, anchors, note
@@ -1902,6 +1912,37 @@ class ReaderView(QWidget):
             panel.set_generating(kind, True)
         self._review_tasks[kind] = task.start()
 
+    def _paper_request(self, kind: str) -> tuple[Callable[[], Callable[..., ReviewRequest]], tuple[str, ...], bool]:
+        """What a run over the whole paper is asked from, gathered now and
+        read in the worker: ``prepare()`` there returns ``ask(until_references
+        =False)``, which builds the request. Also the STT files' names, and
+        whether it is written as a lecture (the mode the review panes show)."""
+        layout, title = self.session.layout, self.session.project.title
+        pdf, deck = self.session.project.pdf_path, self._deck
+        transcripts = self.quiz_store.transcript_parts()
+        read_styles = self._style_reader()
+        lecture = self.review_panels["left"].mode == "lecture"
+
+        def prepare() -> Callable[..., ReviewRequest]:
+            styles = read_styles()
+            try:
+                strays = stray_lines(pdf, layout)
+            except Exception:  # pymupdf raises several unrelated types
+                log.warning("Could not read the lines the layout left out", exc_info=True)
+                strays = {}
+            # The STT is matched to the slides as the quiz matches them, all of it.
+            slides = (deck or SlideDeck(read_pages(pdf))).pages if transcripts else []
+
+            def ask(until_references: bool = False) -> ReviewRequest:
+                return review_request(
+                    kind, title, layout, strays=strays, transcripts=transcripts, slides=slides, styles=styles,
+                    lecture=lecture, until_references=until_references,
+                )
+
+            return ask
+
+        return prepare, tuple(name for name, _ in transcripts), lecture
+
     def stop_review(self, kind: str) -> None:
         task = self._review_tasks.get(kind)
         if task is not None and task.running:
@@ -1918,6 +1959,185 @@ class ReaderView(QWidget):
         self._show_tab(self.note_panel)
         self.statusMessage.emit(f"노트에 넣었습니다: {REVIEW_KINDS[kind]}")
 
+    # -- 백지 복습 (§4e) -----------------------------------------------------------------
+
+    def _cover(self) -> QWidget:
+        """What a pane shows while 백지 is written in the other one."""
+        cover = QWidget()
+        cover.setObjectName("blankCover")
+        layout = QVBoxLayout(cover)
+        layout.addStretch(1)
+        label = QLabel(
+            "<p style='font-size:13pt'><b>백지 쓰는 중</b></p>"
+            "<p style='color:#5f6368'>보지 않고 쓰도록 이쪽은 가려 두었습니다.<br>채점이 끝나면 다시 보입니다.</p>"
+        )
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+        peek = QToolButton(text="그래도 보기")
+        peek.setToolTip("이번 백지가 끝날 때까지 가리지 않습니다.")
+        peek.clicked.connect(self._peek)
+        layout.addWidget(peek, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addStretch(2)
+        return cover
+
+    def _blank_side(self) -> str | None:
+        return next((side for side in SIDES if self._modes[side] == "blank"), None)
+
+    def covered(self, side: str) -> bool:
+        """Whether a pane is hidden because 백지 is being written in the other."""
+        blank = self._blank_side()
+        return blank is not None and side != blank and self.blank_panel.writing and not self._peeking
+
+    def _show_stacks(self) -> None:
+        """Each pane's stack on what its mode shows, or on its cover."""
+        for side in SIDES:
+            mode, stack = self._modes[side], self.stacks[side]
+            if self.covered(side):
+                stack.setCurrentWidget(self._covers[side])
+            elif mode == "blank":
+                stack.setCurrentWidget(self.blank_panel)
+            elif mode in PAGE_MODES:
+                stack.setCurrentWidget(self.scrolls[side])
+            else:
+                stack.setCurrentWidget(self.review_panels[side])
+
+    def _on_blank_writing(self, on: bool) -> None:
+        if on:
+            self._peeking = False
+            self.show_evidence([], scroll=False)
+        self._show_stacks()
+
+    def _peek(self) -> None:
+        self._peeking = True
+        self._show_stacks()
+
+    def generate_blank_sheet(self) -> None:
+        """The keyword sheet and its answer key, from the PDF."""
+        if self._blank_task is not None and self._blank_task.running:
+            return
+        panel = self.blank_panel
+        engine = self._engine_provider()
+        if engine is None:
+            panel.set_error("GPT 사용에 동의하고 Codex가 설치되어 있어야 만들 수 있습니다.")
+            return
+        layout, store, pdf = self.session.layout, self.blank_store, self.session.project.pdf_path
+        prepare, names, lecture = self._paper_request("blank")
+        send_figures = store.send_figures and bool(getattr(engine, "supports_images", True))
+
+        def work(cancel, _report):  # type: ignore[no-untyped-def]
+            generator = CodexBlankGenerator(engine)
+            regions = figure_regions(layout) if send_figures else []
+            # The pictures exist only for this run.
+            with tempfile.TemporaryDirectory(prefix="paper-saver-figures-", ignore_cleanup_errors=True) as folder:
+                figures = []
+                if regions:
+                    try:
+                        with PaperDocument(pdf) as document:
+                            for number, (page, rect) in enumerate(regions, start=1):
+                                path = document.save_region_png(page, rect, Path(folder) / f"figure-{number}.png")
+                                figures.append((page, path))
+                    except Exception:  # pymupdf raises several unrelated types
+                        log.warning("Could not cut the figures out of the PDF", exc_info=True)
+                        figures = []
+                sheet, note = _whole_paper(
+                    prepare(), lambda request: generator.sheet(request, figures=figures, cancel=cancel)
+                )
+            sheet.figures = len(figures)
+            texts = {s.id: s.text for _, _, s in layout.sentences()}
+            anchors = {i: texts[i] for point in sheet.points() for i in point.refs if i in texts}
+            return sheet, anchors, note
+
+        # Kept even if the paper closed meanwhile: it was paid for.
+        def finished(result) -> None:  # type: ignore[no-untyped-def]
+            sheet, anchors, note = result
+            sheet.engine = str(getattr(engine, "key", ""))
+            sheet.model = str(getattr(engine, "chat_model", "") or "")
+            sheet.mode = "lecture" if lecture else "paper"
+            sheet.transcripts = list(names)
+            store.put_sheet(sheet, anchors=anchors)
+            if not self._closed:
+                panel.set_busy("")
+                self.statusMessage.emit(
+                    note or f"백지 복습 준비 완료 — 주제 {len(sheet.topics)}개. 주제를 고르고 '백지 시작'을 누르세요."
+                )
+
+        task = BackgroundTask(work, name="blank-sheet")
+        task.succeeded.connect(finished)
+        task.failed.connect(self._blank_failed)
+        panel.set_busy("sheet")
+        self._blank_task = task.start()
+
+    def grade_blank(self, attempt_id: str) -> None:
+        """Mark what the reader wrote against the key, the PDF beside it."""
+        if self._blank_task is not None and self._blank_task.running:
+            return
+        panel, store = self.blank_panel, self.blank_store
+        attempt, sheet = store.get(attempt_id), store.sheet
+        if attempt is None or sheet is None:
+            return
+        engine = self._engine_provider()
+        if engine is None:
+            panel.set_error("GPT 사용에 동의하고 Codex가 설치되어 있어야 채점할 수 있습니다.")
+            return
+        layout = self.session.layout
+        prepare, _names, _lecture = self._paper_request("blank")
+        topics, written = list(attempt.topics), attempt.text
+
+        def work(cancel, _report):  # type: ignore[no-untyped-def]
+            generator = CodexBlankGenerator(engine)
+            graded, note = _whole_paper(
+                prepare(), lambda request: generator.grade(request, sheet, topics, written, cancel=cancel)
+            )
+            texts = {s.id: s.text for _, _, s in layout.sentences()}
+            anchors = {i: texts[i] for wrong in graded[2] for i in wrong.refs if i in texts}
+            return graded, anchors, note
+
+        # Kept even if the paper closed meanwhile: it was paid for.
+        def finished(result) -> None:  # type: ignore[no-untyped-def]
+            (marks, missing, wrong, overall), anchors, note = result
+            marked = store.grade(
+                attempt_id, marks, missing, wrong, overall, anchors=anchors,
+                model=str(getattr(engine, "chat_model", "") or ""),
+            )
+            if not self._closed:
+                panel.set_busy("")
+                if marked is not None:
+                    got, total = marked.score()
+                    self.statusMessage.emit(
+                        note or f"채점 완료 — {got:g}/{total}. 빠뜨린 것을 누르면 PDF에서 그 문장을 보여 줍니다."
+                    )
+
+        task = BackgroundTask(work, name="blank-grade")
+        task.succeeded.connect(finished)
+        task.failed.connect(self._blank_failed)
+        panel.set_busy("grade")
+        self._blank_task = task.start()
+
+    def _blank_failed(self, exc: Exception) -> None:
+        if self._closed:
+            return
+        self.blank_panel.set_busy("")
+        if isinstance(exc, TranslationCancelled):
+            self.statusMessage.emit("멈췄습니다. 쓴 글은 그대로 저장되어 있습니다.")
+            return
+        text = str(exc)
+        if isinstance(exc, EnginePromptRejected):
+            text += "\n\nOpenAI가 이 PDF의 본문을 거절했습니다. 부록을 뺀 본문도 거절되었습니다."
+        self.blank_panel.set_error(text)
+
+    def stop_blank(self) -> None:
+        if self._blank_task is not None and self._blank_task.running:
+            self._blank_task.cancel()
+
+    def blank_to_note(self, attempt_id: str) -> None:
+        """A marked attempt into the note, its citations as page numbers."""
+        text = self.blank_panel.result_text(attempt_id)
+        if not text:
+            return
+        self.note_panel.append(text)
+        self._show_tab(self.note_panel)
+        self.statusMessage.emit("노트에 넣었습니다: 백지 채점")
+
     # -- lifetime ---------------------------------------------------------------------
 
     def shutdown(self) -> None:
@@ -1931,8 +2151,31 @@ class ReaderView(QWidget):
         self.stop_quiz()
         for kind in list(self._review_tasks):
             self.stop_review(kind)
+        self.blank_panel.flush()
+        self.stop_blank()
         if self._lookup_task is not None:
             self._lookup_task.cancel()
+
+
+_SHORTENED = "OpenAI가 논문 전체를 거절해서(부록에 인용된 프롬프트 때문일 때가 많습니다) 참고문헌 앞까지만 보내 만들었습니다."
+
+
+def _whole_paper(ask, run):  # type: ignore[no-untyped-def]
+    """``run(request)`` over the whole paper, and a note for the reader.
+
+    A grading prompt quoted in an appendix makes OpenAI refuse a paper: then
+    it goes once more up to its references, and the note says so.
+    """
+    request = ask()
+    if not request.numbering:
+        raise TranslationError("이 PDF에서 정리할 본문 문장을 찾지 못했습니다. (스캔한 PDF에는 글자가 없습니다)")
+    try:
+        return run(request), ""
+    except EnginePromptRejected:
+        shorter = ask(until_references=True)
+        if not shorter.numbering or len(shorter.text) >= len(request.text):
+            raise
+        return run(shorter), _SHORTENED
 
 
 def _side_of(canvas: PageCanvas) -> str:
