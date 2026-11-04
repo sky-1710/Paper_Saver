@@ -98,8 +98,29 @@ READ_ME = """Paper Saver
 def install_windows(app: Path) -> None:
     """Copy to %LOCALAPPDATA%\\Programs and make shortcuts, like any per-user app."""
     target = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Paper Saver"
-    shutil.rmtree(target, ignore_errors=True)
-    shutil.copytree(app, target)
+    # A running Paper Saver stops the install: deleting under it left the
+    # install half gone (its exe cannot be deleted, the rest can). Windows
+    # lets a running exe be renamed, not opened for writing.
+    for exe in target.glob("*.exe"):
+        try:
+            exe.open("r+b").close()
+        except PermissionError:
+            raise SystemExit(
+                f"Paper Saver가 실행 중이라 설치할 수 없습니다. 앱을 닫고 다시 실행하세요.\n({exe})"
+            ) from None
+    # Moved aside, not deleted in place, so a copy that fails puts it back.
+    old = target.with_name("Paper Saver.old")
+    shutil.rmtree(old, ignore_errors=True)
+    if target.exists():
+        target.rename(old)
+    try:
+        shutil.copytree(app, target)
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        if old.exists():
+            old.rename(target)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
     exe = target / "Paper Saver.exe"
     script = f"""
 $s = New-Object -ComObject WScript.Shell
