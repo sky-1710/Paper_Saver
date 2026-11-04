@@ -201,6 +201,15 @@ starred question of the lecture, slide by slide, to be answered again: a
 review whose answers are not kept, each slide's name leading to its own quiz.
 The starred questions alone can go into a PDF, the key at the end.
 
+§4c.7 "퀴즈 없는 슬라이드 모두 만들기" makes the quiz of every slide that has
+none, the ones there left as they are, after the reader is told what it
+costs: one Codex run a slide, three at a time as a translation runs. Each
+quiz is kept as it arrives. A slide that fails is marked, to be retried on
+its own, and the rest go on; 중지 or a usage limit ends the run, what was made
+kept. No slide is skipped for having little text: those are the figures and
+worked examples (OS08's FIFO, LRU and clock examples, its workload graphs),
+which the quizzes ask about.
+
 ---
 
 ## 4d. ONE-PAGE REVIEW AND CORNELL NOTES

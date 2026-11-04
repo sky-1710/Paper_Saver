@@ -988,3 +988,83 @@ def test_panel_stars_questions_and_reviews_them_apart(qapp, tmp_path: Path, monk
     link = next(label for label in panel._body.findChildren(QLabel) if "Slide 2" in label.text())
     link.linkActivated.emit("2")
     assert slides == [2] and not panel.showing_favorites and not panel.favorites_button.isChecked()
+
+
+def _deck_pdf(path: Path, topics: list[str]) -> Path:
+    """One slide per topic: a title and a few lines about it."""
+    import pymupdf
+
+    document = pymupdf.open()
+    for topic in topics:
+        page = document.new_page(width=720, height=540)
+        page.insert_text((40, 60), f"{topic} Algorithm", fontsize=28)
+        for row, line in enumerate((f"{topic} replaces the page chosen by its rule", f"{topic} keeps a reference bit per frame")):
+            page.insert_text((60, 140 + 40 * row), line, fontsize=18)
+    document.save(path)
+    document.close()
+    return path
+
+
+def test_reader_makes_every_missing_quiz_and_keeps_going(qapp, tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    from paper_saver.config import Settings
+    from paper_saver.core.quiz import slide_quiz_from_dict
+    from paper_saver.translate.engine import EngineRateLimited
+    from paper_saver.ui.main_window import MainWindow, _prepare
+
+    pdf = _deck_pdf(tmp_path / "OS08-PageReplacement.pdf", ["FIFO", "Belady", "Clock", "Thrashing"])
+    settings = Settings(tmp_path / "settings.json")
+    settings.set("projects_dir", str(tmp_path / "projects"))
+    settings.set("auto_translate", False)
+    window = MainWindow(settings)
+    project, layout = _prepare(pdf, None, settings.projects_dir)(threading.Event(), lambda _m: None)
+    window._opened((project, layout))
+    reader = window.reader
+    store, panel = reader.quiz_store, reader.quiz_panel
+    made = slide_quiz_from_dict(_quiz_dict(), slide=2)
+    store.put(made)
+    panel.refresh()
+    assert panel.missing() == [1, 3, 4]
+
+    class Engine:
+        key = "fake"
+
+        def __init__(self) -> None:
+            self.asked: list[str] = []
+
+        def generate_json(self, prompt, schema, *, images=(), cancel):  # noqa: ANN001
+            topic = next(t for t in ("FIFO", "Belady", "Clock", "Thrashing") if f"{t} keeps a reference bit" in prompt)
+            self.asked.append(topic)
+            time.sleep(0.05)
+            if topic == "Clock":  # never a valid answer: that slide fails, the rest go on
+                return "not json"
+            return json.dumps(_quiz_dict())
+
+    engine = Engine()
+    reader._engine_provider = lambda: engine
+    reader.side.setCurrentWidget(reader.quiz_panel)
+    reader.generate_all_quizzes()
+    assert panel.busy and panel.batch_bar.isVisibleTo(panel) and "0 / 3" in panel.batch_label.text()
+    reader.generate_quiz(1)  # one at a time: ignored while the batch runs
+    _wait(qapp, lambda: not panel.busy)
+    qapp.processEvents()
+
+    assert sorted(engine.asked) == ["Clock", "Clock", "FIFO", "Thrashing"]  # Clock retried once
+    assert store.get(1) is not None and store.get(4) is not None and store.get(3) is None
+    assert store.get(1).questions[0].slide == 1 and store.get(1).title.startswith("FIFO")
+    assert store.get(2) is made  # what was there stays
+    assert "퀴즈 2장을 만들었습니다 · 실패 1장" in panel.batch_label.text()
+    assert 3 in panel._errors and panel.missing() == [3]
+
+    class Limited:
+        key = "fake"
+
+        def generate_json(self, prompt, schema, *, images=(), cancel):  # noqa: ANN001
+            raise EngineRateLimited("usage limit")
+
+    reader._engine_provider = lambda: Limited()
+    reader.generate_all_quizzes()
+    _wait(qapp, lambda: not panel.busy)
+    qapp.processEvents()
+    assert "사용량 한도" in panel.batch_label.text() and panel.missing() == [3]
+    window.close()

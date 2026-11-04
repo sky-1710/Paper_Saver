@@ -120,6 +120,8 @@ def _mark(answer: Any) -> str:
 class QuizPanel(QWidget):
     #: Make (or remake) the quiz of a slide, numbered from 1.
     generateRequested = Signal(int)
+    #: A quiz for every slide that has none.
+    generateAllRequested = Signal()
     stopRequested = Signal()
     #: Show this slide (from 1) in the reader.
     slideRequested = Signal(int)
@@ -177,6 +179,8 @@ class QuizPanel(QWidget):
         self.showing_favorites = False
         #: Answers given in the starred view: a review, kept until it is left.
         self._review = QuizAttempt()
+        #: 모두 만들기 under way: how many, how many done, the slides being made.
+        self._batch: dict[str, Any] | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -227,6 +231,22 @@ class QuizPanel(QWidget):
         away.addWidget(self.back_button)
         self.away_bar.hide()
         layout.addWidget(self.away_bar)
+        # 모두 만들기: its progress on every slide, and how it ended.
+        self.batch_bar = QFrame()
+        self.batch_bar.setObjectName("quizAway")
+        batch = QHBoxLayout(self.batch_bar)
+        batch.setContentsMargins(8, 4, 4, 4)
+        self.batch_label = _label("")
+        self.batch_stop = QPushButton("모두 중지")
+        self.batch_stop.clicked.connect(self.stopRequested.emit)
+        self.batch_close = QToolButton(text="✕")
+        self.batch_close.setToolTip("닫기")
+        self.batch_close.clicked.connect(self.batch_bar.hide)
+        batch.addWidget(self.batch_label, 1)
+        batch.addWidget(self.batch_stop)
+        batch.addWidget(self.batch_close)
+        self.batch_bar.hide()
+        layout.addWidget(self.batch_bar)
 
         self._body = QWidget()
         self._body_layout = QVBoxLayout(self._body)
@@ -588,8 +608,17 @@ class QuizPanel(QWidget):
             self._errors.pop(slide, None)
         self.refresh()
 
+    @property
+    def busy(self) -> bool:
+        """A quiz, or 모두 만들기, is being made: one at a time."""
+        return self._generating is not None or self._batch is not None
+
+    def missing(self) -> list[int]:
+        """The slides with no quiz yet."""
+        return [n for n in range(1, self.slide_count + 1) if self.store.get(n) is None]
+
     def _request(self, *, confirm: bool = False) -> None:
-        if self._generating is not None:
+        if self.busy:
             return
         attempt = self.store.attempts.get(self.slide)
         if confirm and attempt is not None and attempt.answers:
@@ -601,6 +630,76 @@ class QuizPanel(QWidget):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self.generateRequested.emit(self.slide)
+
+    def _request_all(self) -> None:
+        if self.busy:
+            return
+        count = len(self.missing())
+        if not count:
+            QMessageBox.information(self, "퀴즈 모두 만들기", "모든 슬라이드에 이미 퀴즈가 있습니다.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "퀴즈 모두 만들기",
+            f"퀴즈가 없는 슬라이드 {count}장의 퀴즈를 만듭니다. 이미 있는 퀴즈는 그대로 둡니다.\n\n"
+            f"슬라이드마다 Codex를 한 번씩 실행하므로 그만큼 ChatGPT 사용량이 들고, "
+            f"세 장씩 함께 만들어 대략 {max(1, count // 3)}–{max(2, count * 2 // 3)}분 걸립니다. "
+            "만든 퀴즈는 바로바로 저장되고, 중지하면 거기까지 남습니다.\n\n계속할까요?",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.generateAllRequested.emit()
+
+    # -- 모두 만들기 ------------------------------------------------------------------
+
+    def start_batch(self, total: int) -> None:
+        self._batch = {"total": total, "done": 0, "running": set()}
+        self._show_batch()
+        self.refresh()
+
+    def batch_progress(self, slide: int, kind: str) -> None:
+        """``kind``: "start", or how that slide ended - "quiz", "failed", "stopped"."""
+        if self._batch is None:
+            return
+        running: set[int] = self._batch["running"]
+        if kind == "start":
+            running.add(slide)
+        else:
+            running.discard(slide)
+            self._batch["done"] += 1
+            if kind == "quiz":
+                self._errors.pop(slide, None)
+        self._show_batch()
+        if slide == self.slide or kind == "quiz":
+            self.refresh()
+
+    def finish_batch(self, message: str) -> None:
+        self._batch = None
+        self.batch_label.setText(message)
+        self.batch_stop.hide()
+        self.batch_close.show()
+        self.batch_bar.show()
+        self.refresh()
+
+    def _show_batch(self) -> None:
+        batch = self._batch
+        if batch is None:
+            return
+        now = ", ".join(str(n) for n in sorted(batch["running"]))
+        self.batch_label.setText(
+            f"퀴즈 모두 만드는 중 · {batch['done']} / {batch['total']}" + (f" · Slide {now}" if now else "")
+        )
+        self.batch_stop.show()
+        self.batch_close.hide()
+        self.batch_bar.show()
+
+    def _all_button(self) -> QPushButton | None:
+        count = len(self.missing())
+        if not count:
+            return None
+        button = self._button(f"퀴즈 없는 슬라이드 모두 만들기 ({count}장)", self._request_all)
+        button.setToolTip("퀴즈가 없는 슬라이드마다 O/X 3문제를 차례로 만듭니다. 이미 있는 퀴즈는 그대로 둡니다.")
+        button.setEnabled(not self.busy)
+        return button
 
     # -- drawing -----------------------------------------------------------------------
 
@@ -624,7 +723,7 @@ class QuizPanel(QWidget):
         error = self._errors.get(self.slide)
         if self.showing_favorites:
             self._draw_favorites()
-        elif self._generating == self.slide:
+        elif self._generating == self.slide or (self._batch is not None and self.slide in self._batch["running"]):
             self._draw_generating()
         elif error:
             self._draw_error(error)
@@ -658,25 +757,28 @@ class QuizPanel(QWidget):
 
     def _draw_empty(self) -> None:
         self._add(_label("이 슬라이드의 O/X 퀴즈 3문제(Easy · Medium · Hard)를 만듭니다.", "quizLead"))
-        busy = self._generating is not None
-        if busy:
+        if self._batch is not None:
+            self._add(_label("퀴즈를 모두 만드는 중입니다. 곧 이 슬라이드 차례가 옵니다.", "muted"))
+        elif self._generating is not None:
             self._add(_label(f"Slide {self._generating}의 퀴즈를 만드는 중입니다. 끝나면 이 슬라이드도 만들 수 있습니다.", "muted"))
         button = self._button("Generate Quiz", self._request, primary=True)
-        button.setEnabled(not busy)
+        button.setEnabled(not self.busy)
         self._add(self._row(button))
+        if (all_button := self._all_button()) is not None:
+            self._add(self._row(all_button))
         if not self.store.transcripts:
             self._add(_label("STT를 등록하지 않았습니다. 슬라이드만으로 문제를 만듭니다.", "muted"))
 
     def _draw_generating(self) -> None:
         self._add(_label("Generating quiz…", "quizLead"))
         self._add(_label("Codex가 슬라이드와 강의 내용을 읽고 문제를 쓰고 있습니다. (보통 30초–2분)", "muted"))
-        self._add(self._row(self._button("중지", self.stopRequested.emit)))
+        self._add(self._row(self._button("모두 중지" if self._batch is not None else "중지", self.stopRequested.emit)))
 
     def _draw_error(self, message: str) -> None:
         self._add(_label("Quiz generation failed.", "quizError"))
         self._add(_label(message, "muted"))
         retry = self._button("Retry", self._request, primary=True)
-        retry.setEnabled(self._generating is None)
+        retry.setEnabled(not self.busy)
         self._add(self._row(retry))
 
     def _draw_quiz(self, quiz: SlideQuiz, attempt: QuizAttempt) -> None:
@@ -703,8 +805,10 @@ class QuizPanel(QWidget):
         menu.addAction("퀴즈 JSON 가져오기…", self._import)
         more.setMenu(menu)
         regenerate = self._button("Regenerate Quiz", lambda: self._request(confirm=True))
-        regenerate.setEnabled(self._generating is None)
+        regenerate.setEnabled(not self.busy)
         self._add(self._row(more, regenerate))
+        if (all_button := self._all_button()) is not None:
+            self._add(self._row(all_button))
 
     def _result(self, correct: int, total: int) -> QFrame:
         box = QFrame()

@@ -26,8 +26,11 @@ import logging
 import re
 import sys
 import tempfile
+import threading
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -85,7 +88,7 @@ from ..core.lecture_saver import (
 from ..core.notebook import IMAGE_SUFFIXES
 from ..core.obsidian import ObsidianError, is_vocab_vault, register_word
 from ..core.project import HIGHLIGHT_COLORS, Project, WordEntry
-from ..core.quiz import QuizQuestion, QuizStore, StyleLibrary, id_prefix
+from ..core.quiz import QuizQuestion, QuizStore, SlideQuiz, StyleLibrary, id_prefix
 from ..core.review import KINDS as REVIEW_KINDS
 from ..core.review import ReviewStore, plain_citations, refs_in
 from ..pdf.document import PaperDocument
@@ -137,6 +140,9 @@ GPT_KEY = "Ctrl+Shift+G" if sys.platform == "darwin" else "Ctrl+G"
 EXPLAIN_QUESTION = "이 문장을 쉽게 풀어서 설명해 주세요. 핵심 용어와, 앞뒤 맥락에서 이 문장이 하는 역할도 알려 주세요."
 #: Captures sent again with a follow-up question, at most.
 FOLLOW_UP_IMAGES = 3
+#: Quizzes made at once by 모두 만들기: as many Codex runs as a translation
+#: keeps going (runner.DEFAULT_PARALLEL).
+QUIZ_PARALLEL = 3
 #: How the keys read in messages: Cmd on a Mac.
 _MOD = "⌘⇧" if sys.platform == "darwin" else "Ctrl+"
 
@@ -474,6 +480,7 @@ class ReaderView(QWidget):
         self.note_panel.statusMessage.connect(self.statusMessage)
 
         self.quiz_panel.generateRequested.connect(self.generate_quiz)
+        self.quiz_panel.generateAllRequested.connect(self.generate_all_quizzes)
         self.quiz_panel.stopRequested.connect(self.stop_quiz)
         self.quiz_panel.slideRequested.connect(self._show_slide)
         self.quiz_panel.evidenceRequested.connect(self._quiz_evidence)
@@ -1529,28 +1536,42 @@ class ReaderView(QWidget):
         if not self._closed:
             self.quiz_panel.set_titles({page + 1: title for page, title in deck.titles().items()})
 
-    def generate_quiz(self, slide: int) -> None:
-        if self._quiz_task is not None and self._quiz_task.running:
-            return
-        engine = self._engine_provider()
-        if engine is None:
-            self.quiz_panel.set_error(slide, "GPT 사용에 동의하고 Codex가 설치되어 있어야 퀴즈를 만들 수 있습니다.")
-            return
+    def _quiz_maker(
+        self, engine: TranslationEngine
+    ) -> tuple[Callable[[int, threading.Event], SlideQuiz], Callable[[], SlideDeck]]:
+        """What a slide's quiz is made from, taken on the UI thread: a function
+        that makes one slide's quiz in a worker, and one that gives the deck.
+
+        The deck, the STT matched to it and the style examples are read once,
+        however many slides are made; PyMuPDF is used by one thread at a time.
+        """
         project, store = self.session.project, self.quiz_store
         pdf, deck = project.pdf_path, self._deck
         transcripts, read_styles = store.transcript_parts(), self._style_reader()
-        image_path = store.root / QuizStore.FOLDER / "slides" / f"slide-{slide}.png" if store.send_slide_image else None
+        images = store.root / QuizStore.FOLDER / "slides" if store.send_slide_image else None
         prefix, lecture = id_prefix(project.title), project.title
+        lock = threading.Lock()
+        read: dict[str, Any] = {}
 
-        def work(cancel, _report):  # type: ignore[no-untyped-def]
-            styles = read_styles()
-            slides = deck or SlideDeck(read_pages(pdf))
-            page = slide - 1
+        def context() -> dict[str, Any]:
+            with lock:
+                if not read:
+                    slides = deck or SlideDeck(read_pages(pdf))
+                    sections = combine_transcripts([parse_transcript(text) for _, text in transcripts]) if transcripts else []
+                    read.update(
+                        slides=slides, sections=sections, styles=read_styles(),
+                        matched=align_transcript(slides.pages, sections) if sections else {},
+                    )
+                return read
+
+        def make(slide: int, cancel: threading.Event) -> SlideQuiz:
+            found = context()
+            slides, page = found["slides"], slide - 1
             content = slides.content(page)
             excerpt = section = ""
-            if transcripts:
-                sections = combine_transcripts([parse_transcript(text) for _, text in transcripts])
-                excerpt, section = transcript_excerpt(sections, align_transcript(slides.pages, sections).get(page, []))
+            if found["sections"]:
+                excerpt, section = transcript_excerpt(found["sections"], found["matched"].get(page, []))
+            image_path = images / f"slide-{slide}.png" if images is not None else None
             if not content.strip() and not excerpt.strip() and image_path is None:
                 raise TranslationError(
                     "이 슬라이드에서 텍스트를 찾지 못했고 연결된 STT도 없습니다.\n"
@@ -1558,14 +1579,30 @@ class ReaderView(QWidget):
                 )
             image = None
             if image_path is not None:
-                with PaperDocument(pdf) as document:
+                with lock, PaperDocument(pdf) as document:
                     image = document.save_png(page, image_path)
             request = QuizGenerationInput(
                 slide_number=slide, slide_title=slides.title(page), slide_content=content,
-                transcript_content=excerpt, transcript_section=section, quiz_style_examples=styles,
+                transcript_content=excerpt, transcript_section=section, quiz_style_examples=found["styles"],
                 lecture_title=lecture, slide_image=image, id_prefix=prefix,
             )
-            return slides, CodexQuizGenerator(engine).generate_slide_quiz(request, cancel=cancel)
+            return CodexQuizGenerator(engine).generate_slide_quiz(request, cancel=cancel)
+
+        return make, lambda: context()["slides"]
+
+    def generate_quiz(self, slide: int) -> None:
+        if self._quiz_task is not None and self._quiz_task.running:
+            return
+        engine = self._engine_provider()
+        if engine is None:
+            self.quiz_panel.set_error(slide, "GPT 사용에 동의하고 Codex가 설치되어 있어야 퀴즈를 만들 수 있습니다.")
+            return
+        store = self.quiz_store
+        make, deck_of = self._quiz_maker(engine)
+
+        def work(cancel, _report):  # type: ignore[no-untyped-def]
+            quiz = make(slide, cancel)
+            return deck_of(), quiz
 
         def finished(result) -> None:  # type: ignore[no-untyped-def]
             slides, quiz = result
@@ -1589,6 +1626,100 @@ class ReaderView(QWidget):
         task.succeeded.connect(finished)
         task.failed.connect(failed)
         self.quiz_panel.set_generating(slide)
+        self._quiz_task = task.start()
+
+    def generate_all_quizzes(self) -> None:
+        """A quiz for every slide that has none, ``QUIZ_PARALLEL`` Codex runs at
+        a time (§4c.7). Each is kept as it arrives; one that fails is marked on
+        its slide and the rest go on; a usage limit or 중지 ends the run."""
+        if self._quiz_task is not None and self._quiz_task.running:
+            return
+        store = self.quiz_store
+        wanted = [n for n in range(1, self.session.page_count + 1) if store.get(n) is None]
+        if not wanted:
+            return
+        engine = self._engine_provider()
+        if engine is None:
+            self.quiz_panel.finish_batch("GPT 사용에 동의하고 Codex가 설치되어 있어야 퀴즈를 만들 수 있습니다.")
+            return
+        make, deck_of = self._quiz_maker(engine)
+        counts = {"made": 0, "failed": 0}
+
+        def work(cancel, report):  # type: ignore[no-untyped-def]
+            deck_of()  # read once, before the runs share it
+            limited: EngineRateLimited | None = None
+            queue, running = list(wanted), {}
+            with ThreadPoolExecutor(max_workers=QUIZ_PARALLEL, thread_name_prefix="quiz") as pool:
+                while queue or running:
+                    while queue and len(running) < QUIZ_PARALLEL and not cancel.is_set():
+                        slide = queue.pop(0)
+                        running[pool.submit(make, slide, cancel)] = slide
+                        report(("start", slide, None))
+                    if not running:
+                        break
+                    finished, _ = wait(list(running), return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        slide = running.pop(future)
+                        try:
+                            report(("quiz", slide, future.result()))
+                        except TranslationCancelled:
+                            report(("stopped", slide, None))
+                        except EngineRateLimited as exc:
+                            # The others would meet the same limit: stop them.
+                            limited = exc
+                            cancel.set()
+                            report(("stopped", slide, None))
+                        except Exception as exc:  # noqa: BLE001 - one slide's failure is that slide's
+                            report(("failed", slide, str(exc)))
+            if limited is not None:
+                raise limited
+            if cancel.is_set():
+                raise TranslationCancelled()
+            return deck_of()
+
+        def progress(event) -> None:  # type: ignore[no-untyped-def]
+            kind, slide, payload = event
+            if kind == "quiz":
+                # Imported meanwhile from a file: what the reader brought stays.
+                if store.get(slide) is None:
+                    store.put(payload)
+                counts["made"] += 1
+            elif kind == "failed":
+                counts["failed"] += 1
+            if self._closed:
+                return
+            if kind == "failed":
+                self.quiz_panel.set_error(slide, payload)
+            self.quiz_panel.batch_progress(slide, kind)
+
+        def summary() -> str:
+            made, failed = counts["made"], counts["failed"]
+            return f"퀴즈 {made}장을 만들었습니다" + (f" · 실패 {failed}장 (그 슬라이드에서 Retry)" if failed else "")
+
+        def finished(slides) -> None:  # type: ignore[no-untyped-def]
+            if self._deck is None:
+                self._deck_loaded(slides)
+            if not self._closed:
+                self.quiz_panel.finish_batch(summary() + ".")
+                self.statusMessage.emit(summary() + ".")
+
+        def failed(exc: Exception) -> None:
+            if self._closed:
+                return
+            if isinstance(exc, TranslationCancelled):
+                message = f"멈췄습니다. {summary()}."
+            elif isinstance(exc, EngineRateLimited):
+                message = f"ChatGPT 사용량 한도에 걸려 멈췄습니다. {summary()}. 나머지는 나중에 다시 누르면 이어서 만듭니다."
+            else:
+                message = f"{summary()}. 멈춘 이유: {exc}"
+            self.quiz_panel.finish_batch(message)
+            self.statusMessage.emit(message)
+
+        task = BackgroundTask(work, name="quiz-all")
+        task.progress.connect(progress)
+        task.succeeded.connect(finished)
+        task.failed.connect(failed)
+        self.quiz_panel.start_batch(len(wanted))
         self._quiz_task = task.start()
 
     def stop_quiz(self) -> None:
