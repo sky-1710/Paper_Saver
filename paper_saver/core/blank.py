@@ -462,6 +462,8 @@ class BlankStore:
         self.anchors: dict[str, str] = {}
         #: Attach the PDF's figures and tables, as pictures, when the sheet is made.
         self.send_figures = True
+        #: Every attempt id handed out, so a removed one is not handed out again.
+        self._issued: set[str] = set()
         self._load()
 
     # -- disk ------------------------------------------------------------------------
@@ -572,12 +574,14 @@ class BlankStore:
         stale = self.open_attempt()
         if stale is not None and not wrote_anything(stale.text):
             self.attempts.remove(stale)
-        # Never an id an attempt had before, even one since removed.
-        taken = {a.id for a in self.attempts}
+        # Never an id an attempt had before, even one since removed: two
+        # starts can fall in one tick of the clock.
+        taken = {a.id for a in self.attempts} | self._issued
         stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
         attempt_id, extra = f"a{stamp}", 1
         while attempt_id in taken:
             attempt_id, extra = f"a{stamp}-{extra}", extra + 1
+        self._issued.add(attempt_id)
         attempt = Attempt(attempt_id, _now(), scope, text=attempt_template(self.sheet, scope))
         self.attempts.append(attempt)
         self.save()
