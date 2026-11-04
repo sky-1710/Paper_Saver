@@ -1492,7 +1492,8 @@ class ReaderView(QWidget):
         if not page:
             return
         slide = self.quiz_panel.slide
-        if page != slide:
+        # The starred view does not follow the pages, so it is never away.
+        if page != slide and not self.quiz_panel.showing_favorites:
             self._quiz_away = True
             self.quiz_panel.set_away(page)
         first = next((i for i in ids if self._page_of(i) == page - 1), None)
@@ -1607,6 +1608,10 @@ class ReaderView(QWidget):
         titles = self._deck.titles() if self._deck is not None else {}
         titles = {page + 1: title for page, title in titles.items()}
         target, lecture, slides = Path(path), self.session.project.title, self.session.project.pdf_path
+        if layout == "favorites":
+            # The starred questions alone, the key at the end but not the
+            # answers once given: a sheet to do again.
+            quizzes, attempts, layout, lecture = store.favorite_quizzes(), {}, "quiz", f"{lecture} · 즐겨찾기"
 
         def work(_cancel, _report):  # type: ignore[no-untyped-def]
             if layout in PLACEMENTS:

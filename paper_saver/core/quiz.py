@@ -39,6 +39,7 @@ and a card away (``_ANSWER_CHECKS``); nothing else here knows the type.
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 import shutil
@@ -55,6 +56,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "DIFFICULTIES",
+    "Favorite",
     "Material",
     "QuizAttempt",
     "QuizFormatError",
@@ -137,6 +139,34 @@ class SlideQuiz:
 
     def question(self, question_id: str) -> QuizQuestion | None:
         return next((q for q in self.questions if q.id == question_id), None)
+
+
+def question_from_dict(data: Any) -> QuizQuestion:
+    """One question as :meth:`QuizQuestion.to_dict` wrote it."""
+    if not isinstance(data, dict):
+        raise QuizFormatError("문제가 JSON 객체가 아닙니다.")
+    slide = data.get("slide")
+    if not isinstance(slide, int) or isinstance(slide, bool) or slide < 1:
+        raise QuizFormatError("slide 번호가 없습니다.")
+    level = str(data.get("difficulty") or "").strip().lower()
+    if level not in DIFFICULTIES:
+        raise QuizFormatError(f"difficulty '{level}'는 easy/medium/hard가 아닙니다.")
+    kind = str(data.get("type") or "true_false").strip().lower()
+    check = _ANSWER_CHECKS.get(kind)
+    if check is None:
+        raise QuizFormatError(f"지원하지 않는 문제 형식 '{kind}'.")
+    return QuizQuestion(
+        id=str(data.get("id") or f"slide{slide}-{level}"),
+        slide=slide,
+        difficulty=level,
+        type=kind,
+        question=_text(data, "question", "문제"),
+        answer=check(data.get("answer"), "문제"),
+        hint=str(data.get("hint") or "").strip(),
+        explanation=str(data.get("explanation") or "").strip(),
+        slide_title=str(data.get("slideTitle") or ""),
+        source=dict(data["source"]) if isinstance(data.get("source"), dict) else {},
+    )
 
 
 def _text(item: dict[str, Any], key: str, where: str) -> str:
@@ -244,6 +274,15 @@ class QuizAttempt:
         return sum(1 for q in answered if q.is_correct(self.answers[q.id])), len(answered)
 
 
+@dataclass
+class Favorite:
+    """A question the reader starred, kept whole: Regenerate Quiz gives its
+    slide new questions under the same ids, and the starred one stays."""
+
+    question: QuizQuestion
+    starred: str = field(default_factory=_now)
+
+
 # -- materials ---------------------------------------------------------------------
 
 
@@ -291,6 +330,8 @@ class QuizStore:
         self.send_slide_image = False
         self.quizzes: dict[int, SlideQuiz] = {}
         self.attempts: dict[int, QuizAttempt] = {}
+        #: Starred questions, in the order they were starred.
+        self.favorites: list[Favorite] = []
         self._load()
 
     # -- disk ----------------------------------------------------------------------
@@ -330,6 +371,13 @@ class QuizStore:
                 self.attempts[int(key)] = QuizAttempt(
                     answers=dict(item.get("answers") or {}), hints=list(item.get("hints") or [])
                 )
+        for item in data.get("favorites") or []:
+            try:
+                question = question_from_dict(item.get("question") if isinstance(item, dict) else None)
+            except QuizFormatError as exc:
+                log.warning("Skipping a starred question: %s", exc)
+                continue
+            self.favorites.append(Favorite(question, str(item.get("starred") or "")))
 
     def save(self) -> None:
         write_json_atomic(
@@ -347,6 +395,7 @@ class QuizStore:
                     for n, a in sorted(self.attempts.items())
                     if a.answers or a.hints
                 },
+                "favorites": [{"question": f.question.to_dict(), "starred": f.starred} for f in self.favorites],
             },
         )
 
@@ -523,6 +572,45 @@ class QuizStore:
         """Try the same questions again."""
         self.attempts[slide] = QuizAttempt()
         self.save()
+
+    # -- favorites -----------------------------------------------------------------
+
+    def _favorite(self, question: QuizQuestion) -> Favorite | None:
+        # A question is its slide and its wording: ids are reused by Regenerate.
+        return next(
+            (f for f in self.favorites if f.question.slide == question.slide and f.question.question == question.question),
+            None,
+        )
+
+    def is_favorite(self, question: QuizQuestion) -> bool:
+        return self._favorite(question) is not None
+
+    def set_favorite(self, question: QuizQuestion, on: bool) -> None:
+        found = self._favorite(question)
+        if on and found is None:
+            self.favorites.append(Favorite(copy.deepcopy(question)))
+        elif not on and found is not None:
+            self.favorites.remove(found)
+        else:
+            return
+        self.save()
+
+    def favorite_questions(self) -> list[QuizQuestion]:
+        """The starred questions in lecture order: by slide, then Easy to Hard."""
+        order = {level: n for n, level in enumerate(DIFFICULTIES)}
+        ranked = sorted(
+            enumerate(self.favorites),
+            key=lambda item: (item[1].question.slide, order.get(item[1].question.difficulty, 9), item[0]),
+        )
+        return [f.question for _, f in ranked]
+
+    def favorite_quizzes(self) -> dict[int, SlideQuiz]:
+        """The starred questions as one quiz per slide, for a PDF."""
+        quizzes: dict[int, SlideQuiz] = {}
+        for question in self.favorite_questions():
+            quiz = quizzes.setdefault(question.slide, SlideQuiz(question.slide, question.slide_title, []))
+            quiz.questions.append(question)
+        return quizzes
 
     # -- import / export ---------------------------------------------------------
 

@@ -844,7 +844,7 @@ def test_panel_pdf_button_needs_a_quiz(qapp, tmp_path: Path, monkeypatch) -> Non
     requested: list[tuple[str, str]] = []
     panel.pdfExportRequested.connect(lambda path, layout: requested.append((path, layout)))
     actions = panel.pdf_button.menu().actions()
-    assert [a.text() for a in actions] == list(quiz_panel.PDF_LAYOUTS.values())
+    assert [a.text() for a in actions if not a.isSeparator()] == [*quiz_panel.PDF_LAYOUTS.values(), "즐겨찾기한 문제만…"]
     actions[0].trigger()
     actions[2].trigger()
     assert requested == [(target, "quiz"), (target, "below")]
@@ -881,3 +881,110 @@ def test_slides_with_their_quizzes(tmp_path: Path, placement: str) -> None:
         assert "아직 없습니다" in document[1].get_text()  # slide 2 has no quiz, but is still there
         assert "4. [Easy]" in document[2].get_text()  # numbered through, as the key is
         assert "정답 및 해설" in document[3].get_text()
+
+
+# -- favorites ------------------------------------------------------------------------
+
+
+def test_a_starred_question_outlives_regenerate_and_a_reload(tmp_path: Path) -> None:
+    import pymupdf
+
+    from paper_saver.core.quiz import QuizStore, slide_quiz_from_dict
+    from paper_saver.render.quiz_pdf import quiz_pdf
+
+    store = QuizStore(tmp_path)
+    store.put(slide_quiz_from_dict(_quiz_dict(), slide=2))
+    store.put(slide_quiz_from_dict(_quiz_dict(), slide=5))
+    hard2, easy2 = store.get(2).questions[2], store.get(2).questions[0]
+    easy5 = store.get(5).questions[0]
+    for question in (hard2, easy5, easy2):
+        store.set_favorite(question, True)
+    store.set_favorite(easy2, True)  # starring twice keeps one
+    assert len(store.favorites) == 3 and store.is_favorite(hard2)
+
+    # Regenerate: the same ids, new wording. The starred one stays as it was.
+    again = _quiz_dict()
+    again["questions"][0]["question"] = "A page table maps virtual pages to frames."
+    store.put(slide_quiz_from_dict(again, slide=2))
+    fresh = store.get(2).questions[2]
+    assert fresh.id == hard2.id and not store.is_favorite(fresh)
+    assert store.is_favorite(store.get(2).questions[0])  # easy kept its wording
+
+    store = QuizStore(tmp_path)
+    assert [(q.slide, q.difficulty) for q in store.favorite_questions()] == [(2, "easy"), (2, "hard"), (5, "easy")]
+    starred = store.favorite_questions()[1]
+    assert starred.question == hard2.question and starred.answer is True and starred.explanation == hard2.explanation
+    assert starred.slide_title == "Address Spaces"
+    store.set_favorite(easy5, False)
+    assert sorted(store.favorite_quizzes()) == [2] and len(store.favorite_quizzes()[2].questions) == 2
+
+    target = tmp_path / "favorites.pdf"
+    assert quiz_pdf(store.favorite_quizzes(), target, lecture="OS06 · 즐겨찾기") == 1
+    with pymupdf.open(target) as document:
+        text = "\n".join(page.get_text() for page in document)
+    assert "문제 2개" in text and "16KB + 1KB = 17KB." in text
+    assert "Each process needs physically separate memory." not in text  # not starred
+
+
+def test_panel_stars_questions_and_reviews_them_apart(qapp, tmp_path: Path, monkeypatch) -> None:
+    from PySide6.QtWidgets import QLabel, QPushButton, QToolButton
+
+    from paper_saver.core.quiz import QuizStore, slide_quiz_from_dict
+    from paper_saver.ui import quiz_panel
+    from paper_saver.ui.quiz_panel import QuizPanel
+
+    store = QuizStore(tmp_path)
+    store.put(slide_quiz_from_dict(_quiz_dict(), slide=2))
+    store.put(slide_quiz_from_dict(_quiz_dict(), slide=4))
+    panel = QuizPanel(store, 5, "OS06-Memory.pdf", tmp_path)
+    assert panel.favorites_button.text() == "☆ 즐겨찾기" and not panel.favorites_pdf_action.isEnabled()
+
+    def stars() -> list[QToolButton]:
+        return [b for b in panel._body.findChildren(QToolButton) if b.text() in ("☆", "★")]
+
+    def texts() -> list[str]:
+        return [label.text() for label in panel._body.findChildren(QLabel)]
+
+    def click(mark: str) -> None:
+        next(b for b in panel._body.findChildren(QPushButton) if b.text() == mark and b.isEnabled()).click()
+
+    panel.set_slide(2)
+    assert [b.text() for b in stars()] == ["☆", "☆", "☆"]
+    stars()[2].click()  # slide 2, hard
+    panel.set_slide(4)
+    stars()[0].click()  # slide 4, easy
+    assert [b.text() for b in stars()] == ["★", "☆", "☆"]
+    assert panel.favorites_button.text() == "★ 즐겨찾기 2" and panel.favorites_pdf_action.isEnabled()
+
+    panel.favorites_button.click()
+    assert panel.showing_favorites and panel.slide_label.text() == "★ 즐겨찾기 · 2문제"
+    assert panel.next_button.isHidden()
+    assert any("Slide 2 · Address Spaces" in t for t in texts()) and any("Slide 4" in t for t in texts())
+    assert any("If base is 16KB" in t for t in texts()) and "16KB + 1KB = 17KB." not in texts()  # not answered yet
+    # Pages scroll by: the starred view stays.
+    panel.set_slide(3)
+    assert panel.showing_favorites and panel.slide == 3
+    # Answered here, kept apart from the slide's own record.
+    click("X")  # slide 2 hard: answer O
+    assert any(t == "✗ 오답입니다" for t in texts())
+    assert any(t.startswith("맞힌 문제 0 / 2   ·   푼 문제 1 / 2") for t in texts())
+    assert not store.attempt(2).answers
+    next(b for b in panel._body.findChildren(QPushButton) if b.text() == "다시 풀기").click()
+    assert any(t.startswith("맞힌 문제 0 / 2   ·   푼 문제 0 / 2") for t in texts())
+    # Unstarred here, it leaves the list.
+    stars()[1].click()
+    assert panel.slide_label.text() == "★ 즐겨찾기 · 1문제" and len(stars()) == 1
+
+    target = str(tmp_path / "fav.pdf")
+    monkeypatch.setattr(quiz_panel.QFileDialog, "getSaveFileName", lambda *a, **k: (target, ""))
+    requested: list[tuple[str, str]] = []
+    panel.pdfExportRequested.connect(lambda path, layout: requested.append((path, layout)))
+    panel.favorites_pdf_action.trigger()
+    assert requested == [(target, "favorites")]
+
+    # The slide's name goes to that slide's own quiz.
+    slides: list[int] = []
+    panel.slideRequested.connect(slides.append)
+    link = next(label for label in panel._body.findChildren(QLabel) if "Slide 2" in label.text())
+    link.linkActivated.emit("2")
+    assert slides == [2] and not panel.showing_favorites and not panel.favorites_button.isChecked()

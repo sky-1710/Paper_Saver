@@ -23,6 +23,9 @@ card, not a change here.
 
 from __future__ import annotations
 
+import dataclasses
+import html
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -96,6 +99,8 @@ _LEVELS = {
 _RIGHT = "color:#137333; background:#e6f4ea; border:2px solid #34a853;"
 _WRONG = "color:#c5221f; background:#fce8e6; border:2px solid #d93025;"
 _IDLE = "color:#9aa0a6; background:#f8f9fa; border:1px solid #e3e6ea;"
+_STAR_ON = "QToolButton { color:#e0a800; font-size:15px; border:none; } QToolButton:hover { color:#b88a00; }"
+_STAR_OFF = "QToolButton { color:#9aa0a6; font-size:15px; border:none; } QToolButton:hover { color:#e0a800; }"
 
 
 def _label(text: str, name: str = "", *, rich: bool = False) -> QLabel:
@@ -168,6 +173,10 @@ class QuizPanel(QWidget):
         self._material_busy = False
         self._drawn_slide = 0
         self._pdf_busy = False
+        #: The starred questions are shown in place of the slide's quiz.
+        self.showing_favorites = False
+        #: Answers given in the starred view: a review, kept until it is left.
+        self._review = QuizAttempt()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -188,8 +197,18 @@ class QuizPanel(QWidget):
         pdf_menu = QMenu(self.pdf_button)
         for layout_name, text in PDF_LAYOUTS.items():
             pdf_menu.addAction(text, lambda name=layout_name: self.export_pdf(name))
+        pdf_menu.addSeparator()
+        self.favorites_pdf_action = pdf_menu.addAction("즐겨찾기한 문제만…", lambda: self.export_pdf("favorites"))
         self.pdf_button.setMenu(pdf_menu)
+        self.favorites_button = QToolButton()
+        self.favorites_button.setCheckable(True)
+        self.favorites_button.setToolTip(
+            "문제 카드의 ☆로 즐겨찾기한 문제를 모든 슬라이드에서 모아 다시 풉니다.\n"
+            "Regenerate Quiz로 문제를 새로 만들어도 즐겨찾기한 문제는 남습니다."
+        )
+        self.favorites_button.toggled.connect(self.show_favorites)
         head.addWidget(self.slide_label, 1)
+        head.addWidget(self.favorites_button)
         head.addWidget(self.pdf_button)
         head.addWidget(self.prev_button)
         head.addWidget(self.next_button)
@@ -509,12 +528,16 @@ class QuizPanel(QWidget):
         slide = max(1, min(self.slide_count, slide))
         if slide != self.slide:
             self.slide = slide
-            self.refresh()
+            # The starred view stays put; the slide is where it returns to.
+            if self.showing_favorites:
+                self._refresh_head()
+            else:
+                self.refresh()
 
     def set_away(self, page: int | None) -> None:
         """The reader is on ``page`` (from 1) for a question's evidence while
         this tab stays on its slide; None when it follows the pages again."""
-        self.away_bar.setVisible(page is not None)
+        self.away_bar.setVisible(page is not None and not self.showing_favorites)
         if page is not None:
             self.away_label.setText(
                 f"p.{page} 보는 중 — 퀴즈는 Slide {self.slide}에 머뭅니다. 페이지를 누르면 다시 따라갑니다."
@@ -531,6 +554,17 @@ class QuizPanel(QWidget):
             self.slideRequested.emit(self.slide + 1)
 
     def _refresh_head(self) -> None:
+        count = len(self.store.favorites)
+        self.favorites_button.setText(f"★ 즐겨찾기 {count}" if count else "☆ 즐겨찾기")
+        self.favorites_button.setChecked(self.showing_favorites)
+        self.favorites_pdf_action.setEnabled(bool(count))
+        self.pdf_button.setEnabled(bool(self.store.quizzes or count) and not self._pdf_busy)
+        self.prev_button.setVisible(not self.showing_favorites)
+        self.next_button.setVisible(not self.showing_favorites)
+        if self.showing_favorites:
+            self.slide_label.setText(f"★ 즐겨찾기 · {count}문제")
+            self.title_label.hide()
+            return
         quiz = self.store.get(self.slide)
         title = (quiz.title if quiz and quiz.title else "") or self._titles.get(self.slide, "")
         self.slide_label.setText(f"Slide {self.slide} / {self.slide_count}")
@@ -538,7 +572,6 @@ class QuizPanel(QWidget):
         self.title_label.setVisible(bool(title))
         self.prev_button.setEnabled(self.slide > 1)
         self.next_button.setEnabled(self.slide < self.slide_count)
-        self.pdf_button.setEnabled(bool(self.store.quizzes) and not self._pdf_busy)
 
     # -- generation state ------------------------------------------------------------
 
@@ -561,7 +594,9 @@ class QuizPanel(QWidget):
         attempt = self.store.attempts.get(self.slide)
         if confirm and attempt is not None and attempt.answers:
             answer = QMessageBox.question(
-                self, "Regenerate Quiz", "새 문제를 만들면 지금 문제와 풀이 기록이 사라집니다. 계속할까요?"
+                self,
+                "Regenerate Quiz",
+                "새 문제를 만들면 지금 문제와 풀이 기록이 사라집니다 (즐겨찾기한 문제는 남습니다). 계속할까요?",
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -573,8 +608,10 @@ class QuizPanel(QWidget):
         self._refresh_head()
         # Answering redraws the cards; the reader should stay where they were.
         bar = self._scroll.verticalScrollBar()
-        keep = bar.value() if self._drawn_slide == self.slide else 0
-        self._drawn_slide = self.slide
+        # 0 stands for the starred view, which has no slide.
+        shown = 0 if self.showing_favorites else self.slide
+        keep = bar.value() if self._drawn_slide == shown else 0
+        self._drawn_slide = shown
         while self._body_layout.count():
             item = self._body_layout.takeAt(0)
             widget = item.widget()
@@ -585,7 +622,9 @@ class QuizPanel(QWidget):
                 widget.deleteLater()
         quiz = self.store.get(self.slide)
         error = self._errors.get(self.slide)
-        if self._generating == self.slide:
+        if self.showing_favorites:
+            self._draw_favorites()
+        elif self._generating == self.slide:
             self._draw_generating()
         elif error:
             self._draw_error(error)
@@ -684,7 +723,13 @@ class QuizPanel(QWidget):
     # -- answering ---------------------------------------------------------------------
 
     def choose(self, question: QuizQuestion, answer: Any) -> None:
-        if self.store.choose(self.slide, question.id, answer):
+        if self.showing_favorites:
+            if question.id in self._review.answers:
+                return
+            self._review.answers[question.id] = answer
+            self.refresh()
+            self.show_evidence(question)
+        elif self.store.choose(self.slide, question.id, answer):
             self.refresh()
             # The explanation is up: light what it rests on, here and elsewhere.
             self.show_evidence(question)
@@ -720,7 +765,75 @@ class QuizPanel(QWidget):
         return label
 
     def reveal_hint(self, question: QuizQuestion) -> None:
-        self.store.reveal_hint(self.slide, question.id)
+        if self.showing_favorites:
+            if question.id not in self._review.hints:
+                self._review.hints.append(question.id)
+        else:
+            self.store.reveal_hint(self.slide, question.id)
+        self.refresh()
+
+    # -- favorites ---------------------------------------------------------------------
+
+    def toggle_favorite(self, question: QuizQuestion) -> None:
+        self.store.set_favorite(question, not self.store.is_favorite(question))
+        self.refresh()
+
+    def show_favorites(self, shown: bool) -> None:
+        """The starred questions of every slide in place of this slide's quiz;
+        each visit is a fresh review, its answers not kept."""
+        if shown == self.showing_favorites:
+            return
+        self.showing_favorites = shown
+        self._review = QuizAttempt()
+        if shown:
+            self.away_bar.hide()
+        self.refresh()
+
+    def _goto_slide(self, slide: int) -> None:
+        """From the starred view, to that slide's own quiz."""
+        self.show_favorites(False)
+        self.slideRequested.emit(slide)
+
+    def _draw_favorites(self) -> None:
+        questions = self.store.favorite_questions()
+        if not questions:
+            self._add(_label("아직 즐겨찾기한 문제가 없습니다.", "quizLead"))
+            self._add(_label(
+                "문제 카드 오른쪽 위의 ☆를 누르면 여기에 모입니다. 헷갈린 문제, 틀린 문제를 모아 두었다가 "
+                "시험 전에 한 번에 다시 풀어 보세요. Regenerate Quiz로 문제를 새로 만들어도 남습니다.",
+                "muted",
+            ))
+            return
+        # A starred question keeps the id it had, which Regenerate gives the new
+        # one too: the review knows it by its slide and wording.
+        shown = [
+            dataclasses.replace(q, id=f"fav{q.slide}-{zlib.crc32(q.question.encode('utf-8')):08x}") for q in questions
+        ]
+        answered = [q for q in shown if q.id in self._review.answers]
+        correct = sum(1 for q in answered if q.is_correct(self._review.answers[q.id]))
+        self._add(_label(
+            f"맞힌 문제 {correct} / {len(shown)}   ·   푼 문제 {len(answered)} / {len(shown)}", "quizScore"
+        ))
+        self._add(_label("여기서 푼 답은 저장되지 않습니다. 슬라이드 이름을 누르면 그 슬라이드의 퀴즈로 갑니다.", "muted"))
+        for index, question in enumerate(shown, start=1):
+            title = question.slide_title or self._titles.get(question.slide, "")
+            where = QLabel(
+                f'<a href="{question.slide}" style="color:#1a4f8b; text-decoration:none;">'
+                f"Slide {question.slide}{' · ' + html.escape(title) if title else ''}</a>"
+            )
+            where.setObjectName("quizNumber")
+            where.setTextFormat(Qt.TextFormat.RichText)
+            where.setToolTip("그 슬라이드로 가서 그 슬라이드의 퀴즈를 봅니다")
+            where.linkActivated.connect(lambda href: self._goto_slide(int(href)))
+            self._add(where)
+            card = _CARDS.get(question.type)
+            if card is not None:
+                self._add(card(self, question, index, self._review))
+        if answered:
+            self._add(self._row(self._button("다시 풀기", self._restart_review)))
+
+    def _restart_review(self) -> None:
+        self._review = QuizAttempt()
         self.refresh()
 
     def _retry(self) -> None:
@@ -737,12 +850,17 @@ class QuizPanel(QWidget):
 
     def export_pdf(self, layout: str = "quiz") -> None:
         """Ask where, then hand the PDF to the reader view to write."""
-        if not self.store.quizzes:
-            QMessageBox.information(self, "퀴즈 PDF", "내보낼 퀴즈가 없습니다. 먼저 슬라이드에서 퀴즈를 만들어 주세요.")
+        if not (self.store.favorites if layout == "favorites" else self.store.quizzes):
+            message = (
+                "즐겨찾기한 문제가 없습니다. 문제 카드의 ☆를 눌러 즐겨찾기해 주세요."
+                if layout == "favorites"
+                else "내보낼 퀴즈가 없습니다. 먼저 슬라이드에서 퀴즈를 만들어 주세요."
+            )
+            QMessageBox.information(self, "퀴즈 PDF", message)
             return
         if self._pdf_busy:
             return
-        suffix = "퀴즈" if layout == "quiz" else "슬라이드+퀴즈"
+        suffix = {"quiz": "퀴즈", "favorites": "즐겨찾기 퀴즈"}.get(layout, "슬라이드+퀴즈")
         name = f"{self.lecture_title or 'quiz'} - {suffix}.pdf"
         path, _ = QFileDialog.getSaveFileName(self, "퀴즈 PDF로 내보내기", str(self.exports_dir / name), "PDF (*.pdf)")
         if path:
@@ -793,11 +911,18 @@ def _true_false_card(panel: QuizPanel, question: QuizQuestion, index: int, attem
     hint_shown = question.id in attempt.hints
     hint_button.setEnabled(not hint_shown)
     hint_button.clicked.connect(lambda: panel.reveal_hint(question))
+    starred = panel.store.is_favorite(question)
+    star = QToolButton(text="★" if starred else "☆")
+    star.setObjectName("quizStar")
+    star.setStyleSheet(_STAR_ON if starred else _STAR_OFF)
+    star.setToolTip("즐겨찾기에서 빼기" if starred else "즐겨찾기 — 위의 '즐겨찾기'에 모아 시험 전에 다시 풉니다")
+    star.clicked.connect(lambda: panel.toggle_favorite(question))
     top = QHBoxLayout()
     top.addWidget(badge)
     top.addWidget(number)
     top.addStretch(1)
     top.addWidget(hint_button)
+    top.addWidget(star)
     layout.addLayout(top)
 
     layout.addWidget(_label(question.question, "quizQuestion"))

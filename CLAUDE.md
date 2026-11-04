@@ -193,6 +193,14 @@ weighed by how few pages carry it. This matching runs locally; nothing is
 sent. The card lists those pages (근거 위치). Going to one keeps the 퀴즈 tab
 on the question until a page is clicked.
 
+§4c.6 Any question can be starred (☆ on its card). A starred question is
+kept whole in `quiz.json` - its wording, answer, hint and explanation - since
+Regenerate gives its slide new questions under the same ids; so it is known
+by its slide and wording, and outlives Regenerate. "★ 즐겨찾기" shows every
+starred question of the lecture, slide by slide, to be answered again: a
+review whose answers are not kept, each slide's name leading to its own quiz.
+The starred questions alone can go into a PDF, the key at the end.
+
 ---
 
 ## 4d. ONE-PAGE REVIEW AND CORNELL NOTES
@@ -340,8 +348,9 @@ the whole paper.
         chat.json           the GPT conversation
         captures/           captures attached to questions
         chat_files/         files attached to the conversation, with their text
-        quiz.json           slide quizzes, answers, the list of quiz materials:
-                            STT files, linked Lecture Saver projects, linked styles
+        quiz.json           slide quizzes, answers, starred questions, the list of
+                            quiz materials: STT files, linked Lecture Saver projects,
+                            linked styles
         quiz/materials/     STT files copied in, with their text; the text a linked
                             Lecture Saver project held when last read
         review.json         the one-page review and Cornell notes, as Markdown,
